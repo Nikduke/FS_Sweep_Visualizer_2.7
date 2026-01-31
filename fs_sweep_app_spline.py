@@ -9,7 +9,6 @@ import streamlit as st
 import streamlit.components.v1 as components
 import plotly.colors as pc
 import plotly.graph_objects as go
-from plotly.utils import PlotlyJSONEncoder
 from plotly.basedatatypes import BaseTraceType
 
 
@@ -35,12 +34,9 @@ STYLE = {
     "font_color": "#000000",
     "base_font_size_px": 14,
     "tick_font_size_px": 14,
-    "axis_title_font_size_px": 14,
-    "legend_font_size_px": 12,
+    "axis_title_font_size_px": 16,
+    "legend_font_size_px": 14,
     "bold_axis_titles": True,
-    "axis_line_color": "#000000",
-    "axis_line_width": 2,
-    "axis_mirror": False,
 }
 
 AUTO_WIDTH_ESTIMATE_PX = 950  # Used to estimate legend wrapping when "Auto width" is enabled (smaller => safer, avoids clipping).
@@ -534,19 +530,11 @@ def apply_common_layout(
         dtick=1,
         title_font=axis_title_font,
         tickfont=tick_font,
-        showline=True,
-        linecolor=STYLE["axis_line_color"],
-        linewidth=int(STYLE["axis_line_width"]),
-        mirror=bool(STYLE["axis_mirror"]),
     )
     fig.update_yaxes(
         title_text=y_title_txt,
         title_font=axis_title_font,
         tickfont=tick_font,
-        showline=True,
-        linecolor=STYLE["axis_line_color"],
-        linewidth=int(STYLE["axis_line_width"]),
-        mirror=bool(STYLE["axis_mirror"]),
     )
 
 
@@ -612,70 +600,22 @@ def build_x_over_r_spline(df_r: Optional[pd.DataFrame], df_x: Optional[pd.DataFr
     return fig, f_series, xr_dropped, xr_total
 
 
-def _build_export_figure(fig: go.Figure, plot_height: int, width_px: int, legend_entrywidth: int) -> go.Figure:
-    # Export uses client-side measurement; this just creates a deterministic base layout.
-    fig_export = go.Figure(fig.to_dict())
-    min_legend_h = int(LEGEND_ROW_HEIGHT_PX) + int(LEGEND_PADDING_PX)
-    bottom = int(BOTTOM_AXIS_PX) + int(min_legend_h)
-    total_h = int(plot_height) + int(TOP_MARGIN_PX) + int(bottom)
-    fig_export.update_layout(
-        width=int(DEFAULT_FIGURE_WIDTH_PX if int(width_px) <= 0 else int(width_px)),
-        height=int(total_h),
-        autosize=False,
-        margin=dict(
-            l=LEFT_MARGIN_PX,
-            r=RIGHT_MARGIN_PX,
-            t=TOP_MARGIN_PX,
-            b=int(bottom),
-        ),
-        legend=dict(
-            entrywidth=int(legend_entrywidth),
-            entrywidthmode="pixels",
-            orientation="h",
-            x=0.5,
-            xanchor="center",
-            y=-float(BOTTOM_AXIS_PX) / float(max(1, int(plot_height))),
-            yanchor="top",
-        ),
-    )
-    return fig_export
-
-
-def _fig_to_svg_safe_json(fig: go.Figure) -> str:
-    """
-    Convert `scattergl` traces to `scatter` so browser PNG export isn't blank when WebGL is used for speed.
-    """
-    d = fig.to_dict()
-    for tr in d.get("data", []):
-        if tr.get("type") == "scattergl":
-            tr["type"] = "scatter"
-    return json.dumps(d, cls=PlotlyJSONEncoder)
-
-
 def _render_client_png_download(
-    fig: go.Figure,
     filename: str,
-    width_px: int,
-    height_px: int,
     scale: int,
     button_label: str,
     plot_height: int,
     legend_entrywidth: int,
     plot_index: int,
 ):
-    fig_json = _fig_to_svg_safe_json(fig)
-    dom_id = hashlib.sha1(f"{filename}|{width_px}|{height_px}|{scale}".encode("utf-8")).hexdigest()[:12]
+    dom_id = hashlib.sha1(f"{filename}|{scale}|{plot_height}|{legend_entrywidth}|{plot_index}".encode("utf-8")).hexdigest()[:12]
     html = f"""
     <div id="exp-{dom_id}">
       <button id="btn-{dom_id}" style="padding:6px 10px; font-size: 0.9rem; cursor:pointer;">
         {button_label}
       </button>
-      <div id="plot-{dom_id}" style="width:{int(width_px)}px; height:{int(height_px)}px; display:none;"></div>
     </div>
     <script>
-      const fig = {fig_json};
-      const requestedWidthPx = {int(width_px)};
-      const heightPx = {int(height_px)};
       const scale = {int(scale)};
       const plotHeight = {int(plot_height)};
       const topMargin = {int(TOP_MARGIN_PX)};
@@ -684,112 +624,61 @@ def _render_client_png_download(
       const legendEntryWidth = {int(legend_entrywidth)};
       const plotIndex = {int(plot_index)};
       const legendRowH = {int(LEGEND_ROW_HEIGHT_PX)};
-
-      function resolveExportWidthPx() {{
-        // When the app uses "Auto width (fit container)", Python doesn't know the real pixel width.
-        // Measure the already-rendered Plotly chart width from the parent document for a perfect match.
-        if (requestedWidthPx && requestedWidthPx > 0) return requestedWidthPx;
-        try {{
-          const plots = window.parent?.document?.querySelectorAll?.("div.js-plotly-plot");
-          if (plots && plots.length > plotIndex && plots[plotIndex]) {{
-            const r = plots[plotIndex].getBoundingClientRect();
-            const w = Math.floor(r.width || 0);
-            if (w > 0) return w;
-          }}
-        }} catch (e) {{}}
-        // Fallback: a conservative width that usually fits the main column.
-        const w = Math.floor((window.parent?.innerWidth || window.innerWidth || 1400) * 0.72);
-        return Math.max(700, Math.min(2000, w));
-      }}
-
-      function ensurePlotlyLoaded() {{
-        if (window.Plotly) return Promise.resolve(window.Plotly);
-        return new Promise((resolve, reject) => {{
-          const script = document.createElement("script");
-          script.src = "https://cdn.plot.ly/plotly-2.30.0.min.js";
-          script.async = true;
-          script.onload = () => resolve(window.Plotly);
-          script.onerror = () => reject(new Error("Failed to load Plotly from CDN"));
-          document.head.appendChild(script);
-        }});
-      }}
+      const filename = {json.dumps(filename)};
 
       async function doExport() {{
-        let Plotly;
+        let oldHeight = null;
+        let oldMarginB = null;
         try {{
-          Plotly = await ensurePlotlyLoaded();
-        }} catch (e) {{
-          return;
-        }}
+          const Plotly = window.parent?.Plotly;
+          if (!Plotly) return;
+          const plots = window.parent?.document?.querySelectorAll?.("div.js-plotly-plot");
+          if (!plots || plots.length <= plotIndex) return;
+          const gd = plots[plotIndex];
+          if (!gd) return;
 
-        const container = document.getElementById("plot-{dom_id}");
+          const r = gd.getBoundingClientRect();
+          const widthPx = Math.floor(r.width || 0);
+          if (!widthPx) return;
 
-        function setFrameHeight(px) {{
-          try {{
-            window.parent.postMessage({{
-              isStreamlitMessage: true,
-              type: "streamlit:setFrameHeight",
-              height: px
-            }}, "*");
-          }} catch (e) {{}}
-        }}
-
-        container.style.display = "block";
-        try {{
-          const cfg = {{displayModeBar: false, staticPlot: true}};
-
-          const widthPx = resolveExportWidthPx();
-          const baseLayout = Object.assign({{}}, fig.layout || {{}});
-          baseLayout.width = widthPx;
-          baseLayout.autosize = false;
-          baseLayout.margin = Object.assign({{}}, baseLayout.margin || {{}});
-          baseLayout.margin.t = topMargin;
-          baseLayout.margin.l = {int(LEFT_MARGIN_PX)};
-          baseLayout.margin.r = {int(RIGHT_MARGIN_PX)};
-
-          baseLayout.legend = Object.assign({{}}, baseLayout.legend || {{}});
-
-          // Build a "full legend" layout by expanding height to fit all legend rows.
-          // Keep Plotly legend (no manual legend drawing) so styling matches the on-page figure.
-          const traces = Array.isArray(fig.data) ? fig.data : [];
-          const legendItems = traces.filter((tr) => tr && tr.name && tr.showlegend !== false);
+          const data = Array.isArray(gd.data) ? gd.data : [];
+          const legendItems = data.filter((tr) => tr && tr.name && tr.showlegend !== false);
           const usableW = Math.max(1, widthPx - {int(LEFT_MARGIN_PX)} - {int(RIGHT_MARGIN_PX)});
           const cols = Math.max(1, Math.floor(usableW / Math.max(1, legendEntryWidth)));
           const rows = Math.ceil(legendItems.length / cols);
           const legendH = rows * legendRowH + legendPad;
 
-          baseLayout.height = plotHeight + topMargin + bottomAxis + legendH;
-          baseLayout.margin.b = bottomAxis + legendH;
+          oldHeight = gd._fullLayout?.height;
+          oldMarginB = gd._fullLayout?.margin?.b;
 
-          baseLayout.legend = Object.assign({{}}, baseLayout.legend || {{}});
-          baseLayout.legend.entrywidth = legendEntryWidth;
-          baseLayout.legend.entrywidthmode = "pixels";
-          baseLayout.legend.orientation = "h";
-          baseLayout.legend.x = 0.5;
-          baseLayout.legend.xanchor = "center";
-          baseLayout.legend.y = -(bottomAxis / Math.max(1, plotHeight));
-          baseLayout.legend.yanchor = "top";
+          const newHeight = plotHeight + topMargin + bottomAxis + legendH;
+          const newMarginB = bottomAxis + legendH;
 
-          // Ensure the component iframe isn't clipping the plot while we render/export.
-          const renderH = baseLayout.height || (plotHeight + topMargin + bottomAxis + 400);
-          setFrameHeight(renderH + 120);
-          container.style.height = renderH + "px";
-          container.style.overflow = "visible";
-          await Plotly.newPlot(container, fig.data, baseLayout, cfg);
+          await Plotly.relayout(gd, {{
+            height: newHeight,
+            "margin.b": newMarginB,
+          }});
 
-          const finalH = (container && container._fullLayout && container._fullLayout.height) ? container._fullLayout.height : (baseLayout.height || renderH);
-          const url = await Plotly.toImage(container, {{format: "png", width: widthPx, height: finalH, scale}});
+          const url = await Plotly.toImage(gd, {{format: "png", width: widthPx, height: newHeight, scale}});
           const a = document.createElement("a");
           a.href = url;
-          a.download = "{filename}";
+          a.download = filename;
           document.body.appendChild(a);
           a.click();
           a.remove();
         }} catch (e) {{
         }} finally {{
-          container.style.display = "none";
-          container.style.height = "1px";
-          setFrameHeight(70);
+          try {{
+            const Plotly = window.parent?.Plotly;
+            const plots = window.parent?.document?.querySelectorAll?.("div.js-plotly-plot");
+            const gd = (plots && plots.length > plotIndex) ? plots[plotIndex] : null;
+            if (Plotly && gd) {{
+              const restore = {{}};
+              if (typeof oldHeight === "number") restore.height = oldHeight;
+              if (typeof oldMarginB === "number") restore["margin.b"] = oldMarginB;
+              if (Object.keys(restore).length) await Plotly.relayout(gd, restore);
+            }}
+          }} catch (e) {{}}
         }}
       }}
 
@@ -961,18 +850,13 @@ def main():
         st.caption(f"X/R: dropped {xr_dropped} of {xr_total} points where |R| < 1e-9 or data missing.")
 
     export_scale = 4
-    export_width_px = int(figure_width_px) if not use_auto_width else -1
     with download_area:
         st.subheader("Download (Full Legend)")
-        st.caption("Browser PNG download (requires access to https://cdn.plot.ly).")
+        st.caption("Browser PNG download (temporarily expands the on-page chart legend, then downloads).")
         cols = st.columns(3)
         with cols[0]:
-            fig_x_export = _build_export_figure(fig_x, plot_height, export_width_px, legend_entrywidth)
             _render_client_png_download(
-                fig_x_export,
                 filename="X_full_legend.png",
-                width_px=export_width_px,
-                height_px=int(fig_x_export.layout.height or 800),
                 scale=export_scale,
                 button_label="X PNG",
                 plot_height=plot_height,
@@ -980,12 +864,8 @@ def main():
                 plot_index=0,
             )
         with cols[1]:
-            fig_r_export = _build_export_figure(fig_r, plot_height, export_width_px, legend_entrywidth)
             _render_client_png_download(
-                fig_r_export,
                 filename="R_full_legend.png",
-                width_px=export_width_px,
-                height_px=int(fig_r_export.layout.height or 800),
                 scale=export_scale,
                 button_label="R PNG",
                 plot_height=plot_height,
@@ -993,12 +873,8 @@ def main():
                 plot_index=1,
             )
         with cols[2]:
-            fig_xr_export = _build_export_figure(fig_xr, plot_height, export_width_px, legend_entrywidth)
             _render_client_png_download(
-                fig_xr_export,
                 filename="X_over_R_full_legend.png",
-                width_px=export_width_px,
-                height_px=int(fig_xr_export.layout.height or 800),
                 scale=export_scale,
                 button_label="X/R PNG",
                 plot_height=plot_height,
