@@ -809,6 +809,13 @@ def _enable_zoom_persistence(storage_key: str = "fs_sweep_zoom_state_v1", plot_c
     <div style="display:none"></div>
     <script>
       (function () {{
+        // Install once in the parent page to avoid repeated observers/polls on every rerun.
+        const installTag = "fs_sweep_zoom_v2";
+        try {{
+          if (window.parent && window.parent.__fsSweepZoomInstalled === installTag) return;
+          if (window.parent) window.parent.__fsSweepZoomInstalled = installTag;
+        }} catch (e) {{}}
+
         const storageKey = {json.dumps(storage_key)};
         const plotCount = {int(plot_count)};
 
@@ -848,6 +855,10 @@ def _enable_zoom_persistence(storage_key: str = "fs_sweep_zoom_state_v1", plot_c
           return out;
         }}
 
+        function applyOnceKey(idx) {{
+          return "__applied_" + String(idx);
+        }}
+
         function bindPlot(gd, idx) {{
           if (!gd || gd.dataset?.fsZoomBound === "1") return;
           gd.dataset.fsZoomBound = "1";
@@ -870,46 +881,36 @@ def _enable_zoom_persistence(storage_key: str = "fs_sweep_zoom_state_v1", plot_c
             state[key] = prev;
             saveState(state);
           }});
-          // After each (re)draw, re-apply saved ranges (Streamlit often reinitializes plots).
-          gd.on?.("plotly_afterplot", function () {{
-            applyRanges(gd, idx);
-          }});
         }}
 
-        let applying = false;
         function applyRanges(gd, idx) {{
-          if (!gd || applying) return;
+          if (!gd) return;
           const Plotly = window.parent?.Plotly;
           if (!Plotly || !gd._fullLayout) return;
-
-          // Apply at most once per Plotly internal layout uid (changes on re-init).
-          const uid = gd._fullLayout && gd._fullLayout._uid ? String(gd._fullLayout._uid) : "";
-          if (uid && gd.dataset?.fsZoomAppliedUid === uid) return;
+          const appliedKey = applyOnceKey(idx);
+          if (gd.dataset && gd.dataset[appliedKey] === "1") return;
           const state = loadState();
           const saved = state[String(idx)];
           if (!saved) return;
 
           const update = {{}};
           if (Array.isArray(saved.xr) && saved.xr.length === 2) {{
-            update["xaxis.range"] = [Number(saved.xr[0]), Number(saved.xr[1])];
+            update["xaxis.range"] = [saved.xr[0], saved.xr[1]];
           }}
           if (Array.isArray(saved.yr) && saved.yr.length === 2) {{
-            update["yaxis.range"] = [Number(saved.yr[0]), Number(saved.yr[1])];
+            update["yaxis.range"] = [saved.yr[0], saved.yr[1]];
           }}
           if (!Object.keys(update).length) return;
 
-          applying = true;
           Promise.resolve(Plotly.relayout(gd, update))
             .catch(function () {{}})
             .finally(function () {{
               try {{
-                if (uid) gd.dataset.fsZoomAppliedUid = uid;
+                if (gd.dataset) gd.dataset[appliedKey] = "1";
               }} catch (e) {{}}
-              applying = false;
             }});
         }}
 
-        let t = null;
         function sync() {{
           try {{
             const plots = getPlots();
@@ -921,16 +922,13 @@ def _enable_zoom_persistence(storage_key: str = "fs_sweep_zoom_state_v1", plot_c
           }} catch (e) {{}}
         }}
 
-        // Run once after current render, then keep watching for Streamlit remounts/updates.
-        sync();
-        const mo = new window.parent.MutationObserver(function () {{
-          if (t) window.parent.clearTimeout(t);
-          t = window.parent.setTimeout(sync, 80);
-        }});
-        mo.observe(window.parent.document.body, {{ childList: true, subtree: true }});
-
-        // Also poll lightly in case Streamlit updates the plot without DOM mutations.
-        window.parent.setInterval(sync, 800);
+        // Reruns can render plots after this script runs; retry briefly but do not poll forever.
+        let tries = 0;
+        (function tick() {{
+          sync();
+          tries += 1;
+          if (tries < 30) window.parent.setTimeout(tick, 100);
+        }})();
       }})();
     </script>
     """
