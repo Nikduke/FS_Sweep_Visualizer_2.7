@@ -19,7 +19,7 @@ st.set_page_config(page_title="FS Sweep Visualizer (Spline)", layout="wide")
 # NOTE: Keep the bottom-legend layout; axis overlap is handled by axis title standoff.
 DEFAULT_FIGURE_WIDTH_PX = 1400  # Default figure width (px) when auto-width is disabled.
 TOP_MARGIN_PX = 40  # Top margin (px); room for title/toolbar while keeping plot-area height stable.
-BOTTOM_AXIS_PX = 40  # Bottom margin reserved for x-axis title/ticks (px); also defines plot-to-legend vertical gap.
+BOTTOM_AXIS_PX = 50  # Bottom margin reserved for x-axis title/ticks (px); also defines plot-to-legend vertical gap.
 LEFT_MARGIN_PX = 60  # Left margin (px); room for y-axis title and tick labels.
 RIGHT_MARGIN_PX = 20  # Right margin (px); small breathing room to avoid clipping.
 LEGEND_ROW_HEIGHT_FACTOR = 1.6  # legend row height ~= legend_font_size * factor
