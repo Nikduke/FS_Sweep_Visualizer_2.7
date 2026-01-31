@@ -35,12 +35,12 @@ STYLE = {
     "font_color": "#000000",
     "base_font_size_px": 14,
     "tick_font_size_px": 14,
-    "axis_title_font_size_px": 16,
-    "legend_font_size_px": 14,
+    "axis_title_font_size_px": 14,
+    "legend_font_size_px": 12,
     "bold_axis_titles": True,
     "axis_line_color": "#000000",
     "axis_line_width": 2,
-    "axis_mirror": True,
+    "axis_mirror": False,
 }
 
 AUTO_WIDTH_ESTIMATE_PX = 950  # Used to estimate legend wrapping when "Auto width" is enabled (smaller => safer, avoids clipping).
