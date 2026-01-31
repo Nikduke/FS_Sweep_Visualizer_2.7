@@ -868,7 +868,7 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
     <script>
       (function () {{
         const parentWin = window.parent || window;
-        const installTag = "fs_sweep_zoom_qp_v2";
+        const installTag = "fs_sweep_zoom_qp_v3";
         try {{
           if (parentWin.__fsSweepZoomQPInstalled === installTag && typeof parentWin.__fsSweepZoomQPKick === "function") {{
             parentWin.__fsSweepZoomQPKick();
@@ -900,9 +900,6 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
 
         function bind(gd, idx) {{
           if (!gd) return;
-          // Streamlit/Plotly can re-init a chart inside the same DOM node and drop event handlers.
-          // Rebinding is cheap and avoids "first zoom sticks forever" behavior.
-          gd.dataset.fsZoomQPBound = "1";
           gd.on?.("plotly_relayout", function (evt) {{
             if (!evt || typeof evt !== "object") return;
 
@@ -1199,7 +1196,7 @@ def main():
     st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
     st.plotly_chart(fig_xr, use_container_width=bool(use_auto_width), config=download_config, key="plot_xr")
 
-    # Persist zoom/pan by writing axis ranges into URL query params on relayout, then reapplying them on rerun.
+    # Persist zoom/pan by writing axis ranges into URL query params on relayout.
     _bind_zoom_to_query_params(data_id=data_id, plot_count=3)
 
 
