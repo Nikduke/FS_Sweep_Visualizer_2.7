@@ -35,7 +35,7 @@ STYLE = {
     "base_font_size_px": 14,
     "tick_font_size_px": 14,
     "axis_title_font_size_px": 16,
-    "legend_font_size_px": 14,
+    "legend_font_size_px": 12,
     "bold_axis_titles": True,
 }
 
