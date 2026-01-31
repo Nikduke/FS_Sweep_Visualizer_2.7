@@ -851,7 +851,25 @@ def _enable_zoom_persistence(storage_key: str = "fs_sweep_zoom_state_v1", plot_c
         }}
 
         function getPlots() {{
-          return window.parent?.document?.querySelectorAll?.("div.js-plotly-plot") || [];
+          const out = [];
+          try {{
+            const direct = parentWin?.document?.querySelectorAll?.("div.js-plotly-plot") || [];
+            for (const el of direct) out.push(el);
+          }} catch (e) {{}}
+
+          // Streamlit can render Plotly charts inside iframes; crawl them as well.
+          try {{
+            const iframes = parentWin?.document?.querySelectorAll?.("iframe") || [];
+            for (const fr of iframes) {{
+              try {{
+                const doc = fr.contentWindow?.document;
+                const inner = doc?.querySelectorAll?.("div.js-plotly-plot") || [];
+                for (const el of inner) out.push(el);
+              }} catch (e) {{}}
+            }}
+          }} catch (e) {{}}
+
+          return out;
         }}
 
         function extractRanges(evt) {{
@@ -902,7 +920,7 @@ def _enable_zoom_persistence(storage_key: str = "fs_sweep_zoom_state_v1", plot_c
 
         function applyRanges(gd, idx) {{
           if (!gd) return;
-          const Plotly = window.parent?.Plotly;
+          const Plotly = gd.ownerDocument?.defaultView?.Plotly || parentWin?.Plotly;
           if (!Plotly || !gd._fullLayout) return;
           const appliedKey = applyOnceKey(idx);
           if (gd.dataset && gd.dataset[appliedKey] === "1") return;
@@ -967,11 +985,21 @@ def main():
     default_path = "FS_sweep.xlsx"
     st.sidebar.header("Data Source")
     up = st.sidebar.file_uploader("Upload Excel", type=["xlsx"], help="If empty, loads 'FS_sweep.xlsx' from this folder.")
+    data_id = "unknown"
     try:
         if up is not None:
             data = load_fs_sweep_xlsx(up)
+            try:
+                b = up.getvalue()
+                data_id = hashlib.sha1(b).hexdigest()[:10]
+            except Exception:
+                data_id = f"upload:{getattr(up, 'name', 'file')}"
         elif os.path.exists(default_path):
             data = load_fs_sweep_xlsx(default_path)
+            try:
+                data_id = f"local:{int(os.path.getmtime(default_path))}"
+            except Exception:
+                data_id = "local"
             st.sidebar.info(f"Loaded local file: {default_path}")
         else:
             st.warning("Upload an Excel file or place 'FS_sweep.xlsx' here.")
@@ -1169,7 +1197,7 @@ def main():
     st.plotly_chart(fig_xr, use_container_width=bool(use_auto_width), config=download_config, key="plot_xr")
 
     # Keep zoom/pan between Streamlit reruns by storing/restoring axis ranges in browser storage.
-    _enable_zoom_persistence()
+    _enable_zoom_persistence(storage_key=f"fs_sweep_zoom_state_v1:{data_id}")
 
 
 if __name__ == "__main__":
