@@ -874,10 +874,15 @@ def _enable_zoom_persistence(data_id: str, plot_count: int = 3) -> None:
             state[key] = prev;
             saveState(state);
           }});
+          // When Plotly redraws (Streamlit update), allow re-applying the stored ranges.
+          gd.on?.("plotly_afterplot", function () {{
+            try {{ delete gd.dataset.fsZoomApplying; }} catch (e) {{}}
+          }});
         }}
 
         function apply(gd, idx) {{
-          if (!gd || gd.dataset?.fsZoomApplied === "1") return;
+          if (!gd) return;
+          if (gd.dataset?.fsZoomApplying === "1") return;
           const Plotly = gd.ownerDocument?.defaultView?.Plotly || parentWin?.Plotly;
           if (!Plotly || !gd._fullLayout) return;
           const state = loadState();
@@ -886,9 +891,20 @@ def _enable_zoom_persistence(data_id: str, plot_count: int = 3) -> None:
           if (Array.isArray(saved.xr) && saved.xr.length === 2) upd["xaxis.range"] = saved.xr;
           if (Array.isArray(saved.yr) && saved.yr.length === 2) upd["yaxis.range"] = saved.yr;
           if (!Object.keys(upd).length) return;
+
+          // Skip if the plot already has these ranges (prevents fighting user interaction).
+          try {{
+            const curX = gd._fullLayout?.xaxis?.range;
+            const curY = gd._fullLayout?.yaxis?.range;
+            const sameX = Array.isArray(upd["xaxis.range"]) && Array.isArray(curX) && String(curX[0]) === String(upd["xaxis.range"][0]) && String(curX[1]) === String(upd["xaxis.range"][1]);
+            const sameY = Array.isArray(upd["yaxis.range"]) && Array.isArray(curY) && String(curY[0]) === String(upd["yaxis.range"][0]) && String(curY[1]) === String(upd["yaxis.range"][1]);
+            if ((!("xaxis.range" in upd) || sameX) && (!("yaxis.range" in upd) || sameY)) return;
+          }} catch (e) {{}}
+
+          try {{ gd.dataset.fsZoomApplying = "1"; }} catch (e) {{}}
           Promise.resolve(Plotly.relayout(gd, upd))
             .catch(function () {{}})
-            .finally(function () {{ try {{ gd.dataset.fsZoomApplied = "1"; }} catch (e) {{}} }});
+            .finally(function () {{ try {{ delete gd.dataset.fsZoomApplying; }} catch (e) {{}} }});
         }}
 
         function syncOnce() {{
