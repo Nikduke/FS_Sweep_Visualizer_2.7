@@ -266,6 +266,16 @@ def load_fs_sweep_xlsx(path_or_buf) -> Dict[str, pd.DataFrame]:
             value_cols = [c for c in df.columns if c != "Frequency (Hz)"]
             if value_cols:
                 df[value_cols] = df[value_cols].apply(pd.to_numeric, errors="coerce")
+
+            # Prepare numpy arrays once per file load; reused during reruns to speed trace building.
+            freq_hz = df["Frequency (Hz)"].to_numpy(copy=False)
+            series_map: Dict[object, np.ndarray] = {}
+            for c in df.columns:
+                if c == "Frequency (Hz)":
+                    continue
+                series_map[c] = df[c].to_numpy(copy=False)
+            df.attrs["__prepared_arrays__"] = (freq_hz, series_map)
+
             dfs[name] = df
     return dfs
 
@@ -289,14 +299,17 @@ def display_case_name(name: str) -> str:
     return base
 
 
-@st.cache_data(show_spinner=False)
-def prepare_sheet_arrays(df: pd.DataFrame) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+def prepare_sheet_arrays(df: pd.DataFrame) -> Tuple[np.ndarray, Dict[object, np.ndarray]]:
+    cached = getattr(df, "attrs", {}).get("__prepared_arrays__")
+    if cached is not None:
+        return cached
+
     freq_hz = df["Frequency (Hz)"].to_numpy(copy=False)
-    series_map: Dict[str, np.ndarray] = {}
+    series_map: Dict[object, np.ndarray] = {}
     for c in df.columns:
         if c == "Frequency (Hz)":
             continue
-        series_map[str(c)] = df[c].to_numpy(copy=False)
+        series_map[c] = df[c].to_numpy(copy=False)
     return freq_hz, series_map
 
 
