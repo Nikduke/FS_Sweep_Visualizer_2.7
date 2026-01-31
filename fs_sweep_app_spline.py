@@ -870,6 +870,10 @@ def _enable_zoom_persistence(storage_key: str = "fs_sweep_zoom_state_v1", plot_c
             state[key] = prev;
             saveState(state);
           }});
+          // After each (re)draw, re-apply saved ranges (Streamlit often reinitializes plots).
+          gd.on?.("plotly_afterplot", function () {{
+            applyRanges(gd, idx);
+          }});
         }}
 
         let applying = false;
@@ -877,19 +881,32 @@ def _enable_zoom_persistence(storage_key: str = "fs_sweep_zoom_state_v1", plot_c
           if (!gd || applying) return;
           const Plotly = window.parent?.Plotly;
           if (!Plotly || !gd._fullLayout) return;
+
+          // Apply at most once per Plotly internal layout uid (changes on re-init).
+          const uid = gd._fullLayout && gd._fullLayout._uid ? String(gd._fullLayout._uid) : "";
+          if (uid && gd.dataset?.fsZoomAppliedUid === uid) return;
           const state = loadState();
           const saved = state[String(idx)];
           if (!saved) return;
 
           const update = {{}};
-          if (Array.isArray(saved.xr) && saved.xr.length === 2) update["xaxis.range"] = saved.xr;
-          if (Array.isArray(saved.yr) && saved.yr.length === 2) update["yaxis.range"] = saved.yr;
+          if (Array.isArray(saved.xr) && saved.xr.length === 2) {{
+            update["xaxis.range"] = [Number(saved.xr[0]), Number(saved.xr[1])];
+          }}
+          if (Array.isArray(saved.yr) && saved.yr.length === 2) {{
+            update["yaxis.range"] = [Number(saved.yr[0]), Number(saved.yr[1])];
+          }}
           if (!Object.keys(update).length) return;
 
           applying = true;
           Promise.resolve(Plotly.relayout(gd, update))
             .catch(function () {{}})
-            .finally(function () {{ applying = false; }});
+            .finally(function () {{
+              try {{
+                if (uid) gd.dataset.fsZoomAppliedUid = uid;
+              }} catch (e) {{}}
+              applying = false;
+            }});
         }}
 
         let t = null;
@@ -904,13 +921,16 @@ def _enable_zoom_persistence(storage_key: str = "fs_sweep_zoom_state_v1", plot_c
           }} catch (e) {{}}
         }}
 
-        // Run once after current render, then keep watching for Streamlit remounts.
+        // Run once after current render, then keep watching for Streamlit remounts/updates.
         sync();
         const mo = new window.parent.MutationObserver(function () {{
           if (t) window.parent.clearTimeout(t);
           t = window.parent.setTimeout(sync, 80);
         }});
         mo.observe(window.parent.document.body, {{ childList: true, subtree: true }});
+
+        // Also poll lightly in case Streamlit updates the plot without DOM mutations.
+        window.parent.setInterval(sync, 800);
       }})();
     </script>
     """
