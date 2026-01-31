@@ -868,9 +868,12 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
     <script>
       (function () {{
         const parentWin = window.parent || window;
-        const installTag = "fs_sweep_zoom_qp_v1";
+        const installTag = "fs_sweep_zoom_qp_v2";
         try {{
-          if (parentWin.__fsSweepZoomQPInstalled === installTag) return;
+          if (parentWin.__fsSweepZoomQPInstalled === installTag && typeof parentWin.__fsSweepZoomQPKick === "function") {{
+            parentWin.__fsSweepZoomQPKick();
+            return;
+          }}
           parentWin.__fsSweepZoomQPInstalled = installTag;
         }} catch (e) {{}}
 
@@ -917,21 +920,51 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
           }});
         }}
 
+        function getPlots() {{
+          const out = [];
+          try {{
+            const direct = parentWin.document?.querySelectorAll?.("div.js-plotly-plot") || [];
+            for (const el of direct) out.push(el);
+          }} catch (e) {{}}
+
+          // Streamlit commonly renders plotly charts inside iframes.
+          try {{
+            const iframes = parentWin.document?.querySelectorAll?.("iframe") || [];
+            for (const fr of iframes) {{
+              try {{
+                const doc = fr.contentWindow?.document;
+                const inner = doc?.querySelectorAll?.("div.js-plotly-plot") || [];
+                for (const el of inner) out.push(el);
+              }} catch (e) {{}}
+            }}
+          }} catch (e) {{}}
+
+          return out;
+        }}
+
         function syncOnce() {{
           try {{
-            const plots = parentWin.document?.querySelectorAll?.("div.js-plotly-plot") || [];
+            const plots = getPlots();
             const n = Math.min(plotCount, plots.length);
             for (let i = 0; i < n; i++) bind(plots[i], i);
           }} catch (e) {{}}
         }}
 
-        // Retry briefly to catch charts after reruns.
-        let tries = 0;
-        (function tick() {{
-          syncOnce();
-          tries += 1;
-          if (tries < 30) parentWin.setTimeout(tick, 100);
-        }})();
+        function kick() {{
+          // Retry briefly to catch charts after reruns (iframe contents often load after this script runs).
+          let tries = 0;
+          (function tick() {{
+            syncOnce();
+            tries += 1;
+            if (tries < 30) parentWin.setTimeout(tick, 100);
+          }})();
+        }}
+
+        try {{
+          parentWin.__fsSweepZoomQPKick = kick;
+        }} catch (e) {{}}
+
+        kick();
       }})();
     </script>
     """
