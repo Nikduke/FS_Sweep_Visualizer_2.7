@@ -817,107 +817,21 @@ def _render_client_png_download(
     components.html(html, height=70)
 
 
-def _get_query_params() -> Dict[str, List[str]]:
-    # Streamlit renamed query param APIs over time; support both.
-    try:
-        qp = st.query_params  # type: ignore[attr-defined]
-        out: Dict[str, List[str]] = {}
-        for k in qp.keys():
-            v = qp.get_all(k)
-            out[str(k)] = [str(x) for x in v]
-        return out
-    except Exception:
-        try:
-            qp = st.experimental_get_query_params()
-            return {str(k): [str(x) for x in v] for k, v in qp.items()}
-        except Exception:
-            return {}
-
-
-def _apply_zoom_from_query_params(fig: go.Figure, plot_index: int, data_id: str) -> None:
-    qp = _get_query_params()
-    if not qp:
-        return
-
-    if qp.get("zoom_file", [""])[0] != str(data_id):
-        return
-
-    def _f(key: str) -> Optional[float]:
-        raw = qp.get(key, [None])[0]
-        if raw is None:
-            return None
-        try:
-            return float(raw)
-        except Exception:
-            return None
-
-    x0 = _f(f"z{plot_index}_x0")
-    x1 = _f(f"z{plot_index}_x1")
-    y0 = _f(f"z{plot_index}_y0")
-    y1 = _f(f"z{plot_index}_y1")
-
-    if x0 is not None and x1 is not None:
-        fig.update_xaxes(range=[x0, x1], autorange=False)
-    if y0 is not None and y1 is not None:
-        fig.update_yaxes(range=[y0, y1], autorange=False)
-
-
-def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
+def _enable_zoom_persistence(data_id: str, plot_count: int = 3) -> None:
     html = f"""
     <div style="display:none"></div>
     <script>
       (function () {{
         const parentWin = window.parent || window;
-        const installTag = "fs_sweep_zoom_qp_v2";
-        try {{
-          if (parentWin.__fsSweepZoomQPInstalled === installTag && typeof parentWin.__fsSweepZoomQPKick === "function") {{
-            parentWin.__fsSweepZoomQPKick();
-            return;
-          }}
-          parentWin.__fsSweepZoomQPInstalled = installTag;
-        }} catch (e) {{}}
-
         const plotCount = {int(plot_count)};
-        const dataId = {json.dumps(str(data_id))};
+        const storageKey = "fs_sweep_zoom_v1:" + {json.dumps(str(data_id))};
 
-        function setParam(params, k, v) {{
-          if (v === null || v === undefined) params.delete(k);
-          else params.set(k, String(v));
+        function safeParse(s) {{ try {{ return JSON.parse(s || "{{}}") || {{}}; }} catch (e) {{ return {{}}; }} }}
+        function loadState() {{
+          try {{ return safeParse(parentWin.localStorage.getItem(storageKey)); }} catch (e) {{ return {{}}; }}
         }}
-
-        function applyParams(idx, xr, yr) {{
-          try {{
-            const url = new URL(parentWin.location.href);
-            const p = url.searchParams;
-            p.set("zoom_file", dataId);
-            setParam(p, "z" + idx + "_x0", xr ? xr[0] : null);
-            setParam(p, "z" + idx + "_x1", xr ? xr[1] : null);
-            setParam(p, "z" + idx + "_y0", yr ? yr[0] : null);
-            setParam(p, "z" + idx + "_y1", yr ? yr[1] : null);
-            parentWin.history.replaceState({{}}, "", url.toString());
-          }} catch (e) {{}}
-        }}
-
-        function bind(gd, idx) {{
-          if (!gd || gd.dataset?.fsZoomQPBound === "1") return;
-          gd.dataset.fsZoomQPBound = "1";
-          gd.on?.("plotly_relayout", function (evt) {{
-            if (!evt || typeof evt !== "object") return;
-
-            let xr = null;
-            let yr = null;
-            if (evt["xaxis.range[0]"] != null && evt["xaxis.range[1]"] != null) {{
-              xr = [evt["xaxis.range[0]"], evt["xaxis.range[1]"]];
-            }}
-            if (evt["yaxis.range[0]"] != null && evt["yaxis.range[1]"] != null) {{
-              yr = [evt["yaxis.range[0]"], evt["yaxis.range[1]"]];
-            }}
-            if (evt["xaxis.autorange"] === true) xr = null;
-            if (evt["yaxis.autorange"] === true) yr = null;
-
-            // Update URL query params so Python can re-apply ranges on rerun.
-            applyParams(idx, xr, yr);
-          }});
+        function saveState(state) {{
+          try {{ parentWin.localStorage.setItem(storageKey, JSON.stringify(state)); }} catch (e) {{}}
         }}
 
         function getPlots() {{
@@ -926,8 +840,6 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
             const direct = parentWin.document?.querySelectorAll?.("div.js-plotly-plot") || [];
             for (const el of direct) out.push(el);
           }} catch (e) {{}}
-
-          // Streamlit commonly renders plotly charts inside iframes.
           try {{
             const iframes = parentWin.document?.querySelectorAll?.("iframe") || [];
             for (const fr of iframes) {{
@@ -938,33 +850,63 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
               }} catch (e) {{}}
             }}
           }} catch (e) {{}}
-
           return out;
         }}
 
+        function bind(gd, idx) {{
+          if (!gd || gd.dataset?.fsZoomBound === "1") return;
+          gd.dataset.fsZoomBound = "1";
+          gd.on?.("plotly_relayout", function (evt) {{
+            if (!evt || typeof evt !== "object") return;
+            const state = loadState();
+            const key = String(idx);
+            const prev = state[key] || {{}};
+
+            if (evt["xaxis.range[0]"] != null && evt["xaxis.range[1]"] != null) {{
+              prev.xr = [evt["xaxis.range[0]"], evt["xaxis.range[1]"]];
+            }}
+            if (evt["yaxis.range[0]"] != null && evt["yaxis.range[1]"] != null) {{
+              prev.yr = [evt["yaxis.range[0]"], evt["yaxis.range[1]"]];
+            }}
+            if (evt["xaxis.autorange"] === true) delete prev.xr;
+            if (evt["yaxis.autorange"] === true) delete prev.yr;
+
+            state[key] = prev;
+            saveState(state);
+          }});
+        }}
+
+        function apply(gd, idx) {{
+          if (!gd || gd.dataset?.fsZoomApplied === "1") return;
+          const Plotly = gd.ownerDocument?.defaultView?.Plotly || parentWin?.Plotly;
+          if (!Plotly || !gd._fullLayout) return;
+          const state = loadState();
+          const saved = state[String(idx)] || {{}};
+          const upd = {{}};
+          if (Array.isArray(saved.xr) && saved.xr.length === 2) upd["xaxis.range"] = saved.xr;
+          if (Array.isArray(saved.yr) && saved.yr.length === 2) upd["yaxis.range"] = saved.yr;
+          if (!Object.keys(upd).length) return;
+          Promise.resolve(Plotly.relayout(gd, upd))
+            .catch(function () {{}})
+            .finally(function () {{ try {{ gd.dataset.fsZoomApplied = "1"; }} catch (e) {{}} }});
+        }}
+
         function syncOnce() {{
-          try {{
-            const plots = getPlots();
-            const n = Math.min(plotCount, plots.length);
-            for (let i = 0; i < n; i++) bind(plots[i], i);
-          }} catch (e) {{}}
+          const plots = getPlots();
+          const n = Math.min(plotCount, plots.length);
+          for (let i = 0; i < n; i++) {{
+            bind(plots[i], i);
+            apply(plots[i], i);
+          }}
         }}
 
-        function kick() {{
-          // Retry briefly to catch charts after reruns (iframe contents often load after this script runs).
-          let tries = 0;
-          (function tick() {{
-            syncOnce();
-            tries += 1;
-            if (tries < 30) parentWin.setTimeout(tick, 100);
-          }})();
-        }}
-
-        try {{
-          parentWin.__fsSweepZoomQPKick = kick;
-        }} catch (e) {{}}
-
-        kick();
+        // Retry briefly to catch charts after reruns (iframe contents can load after this script runs).
+        let tries = 0;
+        (function tick() {{
+          syncOnce();
+          tries += 1;
+          if (tries < 25) parentWin.setTimeout(tick, 120);
+        }})();
       }})();
     </script>
     """
@@ -1145,10 +1087,7 @@ def main():
         if harm_shapes:
             fig.update_layout(shapes=(fig.layout.shapes + harm_shapes) if fig.layout.shapes else harm_shapes)
 
-    # Restore any user zoom stored in URL query params (overrides the default x-range above).
-    _apply_zoom_from_query_params(fig_x, plot_index=0, data_id=data_id)
-    _apply_zoom_from_query_params(fig_r, plot_index=1, data_id=data_id)
-    _apply_zoom_from_query_params(fig_xr, plot_index=2, data_id=data_id)
+    # Restore user zoom/pan in the browser (handled via localStorage after render).
 
     # Render
     st.subheader(f"Sequence: {seq_label} | Base: {int(f_base)} Hz")
@@ -1194,8 +1133,8 @@ def main():
     st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
     st.plotly_chart(fig_xr, use_container_width=bool(use_auto_width), config=download_config, key="plot_xr")
 
-    # Persist zoom/pan by writing axis ranges into URL query params on relayout, then reapplying them on rerun.
-    _bind_zoom_to_query_params(data_id=data_id, plot_count=3)
+    # Persist zoom/pan (frontend-only): store axis ranges in localStorage and re-apply after reruns.
+    _enable_zoom_persistence(data_id=data_id, plot_count=3)
 
 
 if __name__ == "__main__":
