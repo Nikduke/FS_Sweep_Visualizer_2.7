@@ -16,14 +16,11 @@ from plotly.basedatatypes import BaseTraceType
 st.set_page_config(page_title="FS Sweep Visualizer (Spline)", layout="wide")
 
 # ---- Layout constants ----
-# Keep plot area height stable by:
-# - disabling Plotly margin auto-expansion (legend won't steal plot space)
-# - measuring legend height in the browser and relayouting total figure height
-# - fixing the figure width for deterministic report exports
+# NOTE: Keep the bottom-legend layout; axis overlap is handled by axis title standoff.
 DEFAULT_FIGURE_WIDTH_PX = 1400  # Default figure width (px) when auto-width is disabled.
 TOP_MARGIN_PX = 40  # Top margin (px); room for title/toolbar while keeping plot-area height stable.
-BOTTOM_AXIS_PX = 60  # Bottom margin reserved for x-axis title/ticks (px); also defines plot-to-legend vertical gap.
-LEFT_MARGIN_PX = 60  # Left margin (px); room for y-axis title and tick labels.
+BOTTOM_AXIS_PX = 40  # Bottom margin reserved for x-axis title/ticks (px); also defines plot-to-legend vertical gap.
+LEFT_MARGIN_PX = 40  # Left margin (px); room for y-axis title and tick labels.
 RIGHT_MARGIN_PX = 20  # Right margin (px); small breathing room to avoid clipping.
 LEGEND_ROW_HEIGHT_FACTOR = 1.6  # legend row height ~= legend_font_size * factor
 LEGEND_PADDING_PX = 18  # Extra padding (px) below legend to avoid clipping in exports.
@@ -35,12 +32,16 @@ STYLE = {
     "base_font_size_px": 14,
     "tick_font_size_px": 14,
     "axis_title_font_size_px": 16,
+    # Space between x tick labels and the x-axis title (px). Set to None to use auto heuristic.
+    "xaxis_title_standoff_px": None,
+    # Space between y tick labels and the y-axis title (px). Set to None to use auto heuristic.
+    "yaxis_title_standoff_px": 25,
     "legend_font_size_px": 14,
     "bold_axis_titles": True,
 }
 
-AUTO_WIDTH_ESTIMATE_PX = 950  # Used to estimate legend wrapping when "Auto width" is enabled (smaller => safer, avoids clipping).
-WEB_LEGEND_MAX_HEIGHT_PX = 500  # Max legend area reserved in the web view (px); prevents overlap with the next chart.
+AUTO_WIDTH_ESTIMATE_PX = 950  # Estimate width when Plotly auto-sizes (used for legend row estimation only).
+WEB_LEGEND_MAX_HEIGHT_PX = 500  # Cap legend reserved area on-page to avoid huge gaps between charts.
 DEFAULT_SPLINE_SMOOTHING = 1.0  # Default Plotly spline smoothing when spline mode is enabled.
 EXPORT_IMAGE_SCALE = 4  # PNG scale factor for both modebar and "Full Legend" export.
 
@@ -456,21 +457,30 @@ def apply_common_layout(
     use_auto_width: bool,
     figure_width_px: int,
 ):
-    # Web view: reserve a capped legend area so:
-    # - the plot area stays exactly `plot_height`
-    # - the legend never draws outside the figure (overlapping the next chart)
-    # - if legend is larger than the cap, Plotly shows an internal scrollbar
-    # NOTE: when using auto-width, Python doesn't know the real pixel width. Use a conservative
-    # estimate so we allocate more legend height (avoid clipping/overlap).
+    font_base = dict(family=STYLE["font_family"], color=STYLE["font_color"])
+    # Reserve legend space below the plot so the legend stays at the bottom on-page.
+    # Increase x-axis reserved space when fonts are larger to reduce title/tick overlap on zoom.
+    bottom_axis_px = int(
+        max(
+            int(BOTTOM_AXIS_PX),
+            int(round(float(STYLE["tick_font_size_px"]) * 2.4 + float(STYLE["axis_title_font_size_px"]) * 1.6)),
+        )
+    )
     est_width_px = int(figure_width_px) if not use_auto_width else int(AUTO_WIDTH_ESTIMATE_PX)
     legend_h_full = _estimate_legend_height_px(int(n_traces), est_width_px, int(legend_entrywidth))
-    # Option 2 (web): cap reserved legend area to avoid huge blank gaps between plots.
-    # When the legend exceeds this cap, Plotly may show an internal legend scrollbar.
     legend_h = min(int(WEB_LEGEND_MAX_HEIGHT_PX), int(legend_h_full))
-    total_height = int(plot_height) + int(TOP_MARGIN_PX) + int(BOTTOM_AXIS_PX) + int(legend_h)
-    # Put the legend in the bottom margin so the plot area stays exactly `plot_height`.
-    legend_y = -float(BOTTOM_AXIS_PX) / float(max(1, int(plot_height)))
-    font_base = dict(family=STYLE["font_family"], color=STYLE["font_color"])
+    total_height = int(plot_height) + int(TOP_MARGIN_PX) + int(bottom_axis_px) + int(legend_h)
+    legend_y = -float(bottom_axis_px) / float(max(1, int(plot_height)))
+
+    # Y-axis overlap fix: keep bottom legend behavior, but grow left margin with font sizes
+    # so y tick labels and y title don't collide after zoom.
+    left_margin_px = int(
+        max(
+            int(LEFT_MARGIN_PX),
+            int(round(float(STYLE["tick_font_size_px"]) * 4.4 + float(STYLE["axis_title_font_size_px"]) * 1.6)),
+        )
+    )
+
     fig.update_layout(
         autosize=bool(use_auto_width),
         height=total_height,
@@ -479,10 +489,10 @@ def apply_common_layout(
             size=int(STYLE["base_font_size_px"]),
         ),
         margin=dict(
-            l=LEFT_MARGIN_PX,
+            l=left_margin_px,
             r=RIGHT_MARGIN_PX,
             t=TOP_MARGIN_PX,
-            b=int(BOTTOM_AXIS_PX) + int(legend_h),
+            b=int(bottom_axis_px) + int(legend_h),
         ),
         margin_autoexpand=False,
         legend=dict(
@@ -493,10 +503,7 @@ def apply_common_layout(
             x=0.5,
             entrywidth=int(legend_entrywidth),
             entrywidthmode="pixels",
-            font=dict(
-                **font_base,
-                size=int(STYLE["legend_font_size_px"]),
-            ),
+            font=dict(**font_base, size=int(STYLE["legend_font_size_px"])),
         ),
     )
     if not use_auto_width:
@@ -510,17 +517,33 @@ def apply_common_layout(
 
     axis_title_font = dict(**font_base, size=int(STYLE["axis_title_font_size_px"]))
     tick_font = dict(**font_base, size=int(STYLE["tick_font_size_px"]))
+
+    x_title_standoff = STYLE.get("xaxis_title_standoff_px")
+    if x_title_standoff is None:
+        x_title_standoff = int(max(10, round(float(STYLE["tick_font_size_px"]) * 1.1)))
+    else:
+        x_title_standoff = int(x_title_standoff)
+
+    y_title_standoff = STYLE.get("yaxis_title_standoff_px")
+    if y_title_standoff is None:
+        y_title_standoff = int(max(10, round(float(STYLE["tick_font_size_px"]) * 1.1)))
+    else:
+        y_title_standoff = int(y_title_standoff)
     fig.update_xaxes(
         title_text=x_title,
         tick0=1,
         dtick=1,
         title_font=axis_title_font,
         tickfont=tick_font,
+        automargin=True,
+        title_standoff=x_title_standoff,
     )
     fig.update_yaxes(
         title_text=y_title_txt,
         title_font=axis_title_font,
         tickfont=tick_font,
+        automargin=True,
+        title_standoff=y_title_standoff,
     )
 
 
@@ -611,7 +634,6 @@ def _render_client_png_download(
       const legendEntryWidth = {int(legend_entrywidth)};
       const plotIndex = {int(plot_index)};
       const filename = {json.dumps(filename)};
-      const legendRowHFactor = {float(LEGEND_ROW_HEIGHT_FACTOR)};
       const fallbackLegendFontSize = {int(STYLE["legend_font_size_px"])};
 
       async function doExport() {{
@@ -631,9 +653,16 @@ def _render_client_png_download(
             gd?._fullLayout?.legend?.font?.size ||
             gd?._fullLayout?.font?.size ||
             fallbackLegendFontSize;
-          const legendRowH = Math.ceil(legendFontSize * legendRowHFactor);
-          const legendFontFamily = {json.dumps(STYLE["font_family"])};
-          const legendFontColor = {json.dumps(STYLE["font_color"])};
+          // Legend row height: keep tight to avoid bottom whitespace.
+          const legendRowH = Math.ceil(legendFontSize * 1.25);
+      const legendFontFamily = {json.dumps(STYLE["font_family"])};
+      const legendFontColor = {json.dumps(STYLE["font_color"])};
+
+      const leftMarginBase = {int(LEFT_MARGIN_PX)};
+      const rightMargin = {int(RIGHT_MARGIN_PX)};
+      const tickFontSize = {int(STYLE["tick_font_size_px"])};
+      const axisTitleFontSize = {int(STYLE["axis_title_font_size_px"])};
+      const leftMarginPx = Math.max(leftMarginBase, Math.round(tickFontSize * 4.4 + axisTitleFontSize * 1.6));
 
           const data = Array.isArray(gd.data) ? gd.data : [];
           const data2 = data.map((tr) => {{
@@ -653,7 +682,7 @@ def _render_client_png_download(
             legendItems.push({{name, color}});
           }}
 
-          const usableW = Math.max(1, widthPx - {int(LEFT_MARGIN_PX)} - {int(RIGHT_MARGIN_PX)});
+          const usableW = Math.max(1, widthPx - leftMarginPx - rightMargin);
 
           // Estimate needed entry width using canvas text measurement to avoid overlap for long names.
           let maxTextW = 0;
@@ -677,7 +706,9 @@ def _render_client_png_download(
 
           const cols = Math.max(1, Math.floor(usableW / entryPx));
           const rows = Math.ceil(legendItems.length / cols);
-          const legendH = rows * legendRowH + legendPad;
+          // Total legend area in bottom margin.
+          // Add a small tail so the last row doesn't look cramped, but avoid large blank space.
+          const legendH = (rows * legendRowH) + legendPad + Math.ceil(0.35 * legendFontSize);
 
           const newHeight = plotHeight + topMargin + bottomAxis + legendH;
           const newMarginB = bottomAxis + legendH;
@@ -693,8 +724,8 @@ def _render_client_png_download(
           baseLayout.autosize = false;
           baseLayout.margin = Object.assign({{}}, baseLayout.margin || {{}});
           baseLayout.margin.t = topMargin;
-          baseLayout.margin.l = {int(LEFT_MARGIN_PX)};
-          baseLayout.margin.r = {int(RIGHT_MARGIN_PX)};
+          baseLayout.margin.l = leftMarginPx;
+          baseLayout.margin.r = rightMargin;
           baseLayout.margin.b = newMarginB;
           // Disable Plotly legend and draw a manual legend in the bottom margin so it never scrolls/clips.
           baseLayout.showlegend = false;
@@ -705,14 +736,14 @@ def _render_client_png_download(
           const ann = Array.isArray(baseLayout.annotations) ? baseLayout.annotations.slice() : [];
           const shp = Array.isArray(baseLayout.shapes) ? baseLayout.shapes.slice() : [];
 
-          const xPadPx = Math.min(12, Math.floor(entryPx * 0.10));
-          const legendTotalW = cols * entryPx;
-          const leftOffsetPx = Math.max(0, Math.floor((usableW - legendTotalW) / 2));
+          // Spread columns across the available width to avoid side whitespace and tight columns.
+          const colW = usableW / cols;
+          const xPadPx = Math.max(0, Math.min(12, Math.floor(colW * 0.06)));
 
           for (let i = 0; i < legendItems.length; i++) {{
             const row = Math.floor(i / cols);
             const col = i % cols;
-            const x0 = (leftOffsetPx + col * entryPx + xPadPx) / usableW;
+            const x0 = (col * colW + xPadPx) / usableW;
             const x1 = x0 + (sampleLinePx / usableW);
             const y = -(bottomAxis + legendPad + (row + 0.6) * legendRowH) / Math.max(1, plotHeight);
 
@@ -864,7 +895,8 @@ def main():
         approx_char_px = max(7, int(round(0.60 * float(legend_font_px))))
         base_px = max(44, int(round(3.5 * float(legend_font_px))))  # symbol + padding inside a legend item
 
-        est_width_px = int(figure_width_px) if not use_auto_width else int(AUTO_WIDTH_ESTIMATE_PX)
+        # Only used to cap export legend columns; use the configured width when available.
+        est_width_px = int(figure_width_px)
         usable_w = max(1, int(est_width_px) - int(LEFT_MARGIN_PX) - int(RIGHT_MARGIN_PX))
         desired = int(max_len) * int(approx_char_px) + int(base_px)
         legend_entrywidth = _clamp_int(desired, 50, min(900, usable_w))
