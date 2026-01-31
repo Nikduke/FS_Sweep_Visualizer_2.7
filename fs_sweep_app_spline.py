@@ -1,0 +1,1017 @@
+import os
+import hashlib
+import json
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import streamlit.components.v1 as components
+import plotly.colors as pc
+import plotly.graph_objects as go
+from plotly.utils import PlotlyJSONEncoder
+from plotly.basedatatypes import BaseTraceType
+
+
+# ---- Page config ----
+st.set_page_config(page_title="FS Sweep Visualizer (Spline)", layout="wide")
+
+# ---- Layout constants ----
+# Keep plot area height stable by:
+# - disabling Plotly margin auto-expansion (legend won't steal plot space)
+# - measuring legend height in the browser and relayouting total figure height
+# - fixing the figure width for deterministic report exports
+DEFAULT_FIGURE_WIDTH_PX = 1400  # Default figure width (px) when auto-width is disabled.
+TOP_MARGIN_PX = 40  # Top margin (px); room for title/toolbar while keeping plot-area height stable.
+BOTTOM_AXIS_PX = 60  # Bottom margin reserved for x-axis title/ticks (px); also defines plot-to-legend vertical gap.
+LEFT_MARGIN_PX = 60  # Left margin (px); room for y-axis title and tick labels.
+RIGHT_MARGIN_PX = 20  # Right margin (px); small breathing room to avoid clipping.
+LEGEND_ROW_HEIGHT_PX = 22  # Used for export-size estimation (px per legend row).
+LEGEND_PADDING_PX = 18  # Extra padding (px) below legend to avoid clipping in exports.
+# ---- Style settings (single source of truth) ----
+# Use Plotly layout styling (not CSS) so on-page and exported PNGs match.
+STYLE = {
+    "font_family": "Open Sans, verdana, arial, sans-serif",
+    "font_color": "#000000",
+    "base_font_size_px": 14,
+    "tick_font_size_px": 14,
+    "axis_title_font_size_px": 16,
+    "legend_font_size_px": 14,
+    "bold_axis_titles": True,
+    "axis_line_color": "#000000",
+    "axis_line_width": 2,
+    "axis_mirror": True,
+}
+
+AUTO_WIDTH_ESTIMATE_PX = 950  # Used to estimate legend wrapping when "Auto width" is enabled (smaller => safer, avoids clipping).
+WEB_LEGEND_MAX_HEIGHT_PX = 500  # Max legend area reserved in the web view (px); prevents overlap with the next chart.
+DEFAULT_SPLINE_SMOOTHING = 0.6  # Default Plotly spline smoothing when spline mode is enabled.
+
+
+def _clamp_int(val: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(val)))
+
+
+def _rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
+    r, g, b = (int(_clamp_int(c, 0, 255)) for c in rgb)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _mix_rgb(a: Tuple[int, int, int], b: Tuple[int, int, int], t: float) -> Tuple[int, int, int]:
+    tt = float(max(0.0, min(1.0, t)))
+    return (
+        int(round(a[0] + (b[0] - a[0]) * tt)),
+        int(round(a[1] + (b[1] - a[1]) * tt)),
+        int(round(a[2] + (b[2] - a[2]) * tt)),
+    )
+
+
+def _parse_color_to_rgb255(color: str) -> Tuple[int, int, int]:
+    """
+    Accept Plotly palette entries in either hex ("#rrggbb") or "rgb(...)" / "rgba(...)" form.
+    """
+    c = str(color).strip()
+    if not c:
+        return (68, 68, 68)
+    if c.startswith("#"):
+        return tuple(int(v) for v in pc.hex_to_rgb(c))
+    if c.lower().startswith("rgb"):
+        tup = pc.unlabel_rgb(c)
+        if len(tup) >= 3:
+            return (int(round(tup[0])), int(round(tup[1])), int(round(tup[2])))
+    # handle hex without '#'
+    c2 = c.lstrip().lower()
+    if len(c2) in (3, 6) and all(ch in "0123456789abcdef" for ch in c2):
+        if len(c2) == 3:
+            c2 = "".join([ch * 2 for ch in c2])
+        return tuple(int(v) for v in pc.hex_to_rgb(f"#{c2}"))
+    return (68, 68, 68)
+
+
+def _shade_hex(base_hex: str, position: float) -> str:
+    """
+    Create a shade variant of a base color.
+
+    `position` in [-1..1]:
+      - negative => darken toward black
+      - positive => lighten toward white
+    """
+    base_rgb = _parse_color_to_rgb255(base_hex)
+    p = float(max(-1.0, min(1.0, position)))
+    if p >= 0:
+        # Lighten
+        return _rgb_to_hex(_mix_rgb(base_rgb, (255, 255, 255), t=p * 0.40))
+    # Darken
+    return _rgb_to_hex(_mix_rgb(base_rgb, (0, 0, 0), t=(-p) * 0.25))
+
+
+def build_clustered_case_colors(cases: List[str]) -> Dict[str, str]:
+    """
+    Assign colors so related cases cluster by hue, with lighter/darker shades inside each cluster.
+
+    Location suffix (after `__`) is ignored for grouping.
+    """
+    if not cases:
+        return {}
+
+    bases = [split_case_location(c)[0] for c in cases]
+    split_parts = [str(b).split("_") for b in bases]
+    max_parts = max((len(p) for p in split_parts), default=0)
+    if max_parts <= 0:
+        # Fallback to simple palette
+        palette = pc.qualitative.Safe or pc.qualitative.Plotly or ["#1f77b4"]
+        return {
+            c: palette[i % len(palette)]
+            for i, c in enumerate(sorted(cases))
+        }
+
+    # Normalize parts (pad with "")
+    parts_norm = [p + [""] * (max_parts - len(p)) for p in split_parts]
+
+    # Pick "hue part" as the most varying part (ties => earlier part).
+    uniq_counts = [len(set(row[i] for row in parts_norm)) for i in range(max_parts)]
+    varying = [i for i, n in enumerate(uniq_counts) if n > 1]
+    if not varying:
+        hue_part = 0
+        shade_part = None
+    else:
+        hue_part = sorted(varying, key=lambda i: (-uniq_counts[i], i))[0]
+        rest = [i for i in varying if i != hue_part]
+        shade_part = sorted(rest, key=lambda i: (-uniq_counts[i], i))[0] if rest else None
+
+    # Use a combined palette so we have enough distinct hues if there are many groups.
+    palette = []
+    for pal in (
+        getattr(pc.qualitative, "Safe", None),
+        getattr(pc.qualitative, "D3", None),
+        getattr(pc.qualitative, "Plotly", None),
+        getattr(pc.qualitative, "Dark24", None),
+        getattr(pc.qualitative, "Light24", None),
+    ):
+        if pal:
+            palette.extend(list(pal))
+    if not palette:
+        palette = ["#1f77b4"]
+
+    # Group cases
+    rows = []
+    for case, parts in zip(cases, parts_norm):
+        group = parts[hue_part]
+        shade_key = parts[shade_part] if shade_part is not None else ""
+        rows.append((str(group), str(shade_key), str(case)))
+
+    groups = sorted(set(r[0] for r in rows))
+    group_color = {g: palette[i % len(palette)] for i, g in enumerate(groups)}
+
+    case_colors: Dict[str, str] = {}
+    for g in groups:
+        group_rows = [r for r in rows if r[0] == g]
+        group_rows_sorted = sorted(group_rows, key=lambda r: (r[1], r[2]))
+        k = len(group_rows_sorted)
+        # Spread shades from darker to lighter.
+        positions = np.linspace(-1.0, 1.0, k) if k > 1 else np.array([0.0])
+        for (row, pos) in zip(group_rows_sorted, positions):
+            _group, _shade_key, case = row
+            case_colors[case] = _shade_hex(group_color[g], float(pos))
+
+    return case_colors
+
+
+@st.cache_data(show_spinner=False)
+def cached_clustered_case_colors(cases: Tuple[str, ...]) -> Dict[str, str]:
+    return build_clustered_case_colors(list(cases))
+
+
+@st.cache_data(show_spinner=False)
+def build_harmonic_shapes(
+    n_min: float,
+    n_max: float,
+    f_base: float,
+    show_markers: bool,
+    bin_width_hz: float,
+) -> Tuple[dict, ...]:
+    if not show_markers and (bin_width_hz is None or bin_width_hz <= 0):
+        return tuple()
+    if not np.isfinite(n_min) or not np.isfinite(n_max) or n_min >= n_max:
+        return tuple()
+    if not np.isfinite(f_base) or f_base <= 0:
+        return tuple()
+    shapes: List[dict] = []
+    k_start = max(1, int(np.floor(float(n_min))))
+    k_end = int(np.ceil(float(n_max)))
+    for k in range(k_start, k_end + 1):
+        if show_markers:
+            shapes.append(
+                dict(
+                    type="line",
+                    xref="x",
+                    yref="paper",
+                    x0=k,
+                    x1=k,
+                    y0=0,
+                    y1=1,
+                    line=dict(color="rgba(0,0,0,0.3)", width=1.5),
+                )
+            )
+        if bin_width_hz and bin_width_hz > 0:
+            dn = (float(bin_width_hz) / (2.0 * float(f_base)))
+            for edge in (k - dn, k + dn):
+                shapes.append(
+                    dict(
+                        type="line",
+                        xref="x",
+                        yref="paper",
+                        x0=edge,
+                        x1=edge,
+                        y0=0,
+                        y1=1,
+                        line=dict(color="rgba(0,0,0,0.2)", width=1, dash="dot"),
+                    )
+                )
+    return tuple(shapes)
+
+
+def _estimate_legend_height_px(n_traces: int, width_px: int, legend_entrywidth: int) -> int:
+    usable_w = max(1, int(width_px) - int(LEFT_MARGIN_PX) - int(RIGHT_MARGIN_PX))
+    cols = max(1, int(usable_w // max(1, int(legend_entrywidth))))
+    rows = int(np.ceil(float(n_traces) / float(cols))) if n_traces > 0 else 0
+    return int(rows) * int(LEGEND_ROW_HEIGHT_PX) + int(LEGEND_PADDING_PX)
+
+
+# ---- Data loading ----
+@st.cache_data(show_spinner=False)
+def load_fs_sweep_xlsx(path_or_buf) -> Dict[str, pd.DataFrame]:
+    dfs: Dict[str, pd.DataFrame] = {}
+    xls = pd.ExcelFile(path_or_buf)
+    for name in ["R1", "X1", "R0", "X0"]:
+        if name in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=name)
+            # Frequency column normalization
+            freq_col = None
+            for c in df.columns:
+                c_norm = str(c).strip().lower().replace(" ", "")
+                if c_norm in ["frequency(hz)", "frequencyhz", "frequency_"]:
+                    freq_col = c
+                    break
+                if str(c).strip().lower() in ["frequency (hz)", "frequency"]:
+                    freq_col = c
+                    break
+            if freq_col is None:
+                if "Frequency (Hz)" in df.columns:
+                    freq_col = "Frequency (Hz)"
+                else:
+                    raise ValueError(f"Sheet '{name}' missing 'Frequency (Hz)' column")
+            df = df.rename(columns={freq_col: "Frequency (Hz)"})
+            df["Frequency (Hz)"] = pd.to_numeric(df["Frequency (Hz)"], errors="coerce")
+            df = df.dropna(subset=["Frequency (Hz)"])
+            value_cols = [c for c in df.columns if c != "Frequency (Hz)"]
+            if value_cols:
+                df[value_cols] = df[value_cols].apply(pd.to_numeric, errors="coerce")
+            dfs[name] = df
+    return dfs
+
+
+def list_case_columns(df: Optional[pd.DataFrame]) -> List[str]:
+    if df is None:
+        return []
+    return [c for c in df.columns if c != "Frequency (Hz)"]
+
+
+def split_case_location(name: str) -> Tuple[str, Optional[str]]:
+    if "__" in str(name):
+        base, loc = str(name).split("__", 1)
+        loc = loc if loc else None
+        return base, loc
+    return str(name), None
+
+
+def display_case_name(name: str) -> str:
+    base, _ = split_case_location(name)
+    return base
+
+
+@st.cache_data(show_spinner=False)
+def split_case_parts(cases: List[str]) -> Tuple[List[List[str]], List[str]]:
+    if not cases:
+        return [], []
+    temp_parts: List[Tuple[List[str], str]] = []
+    max_parts = 0
+    for name in cases:
+        base_name, location = split_case_location(name)
+        base_parts = str(base_name).split("_")
+        max_parts = max(max_parts, len(base_parts))
+        temp_parts.append((base_parts, location or ""))
+
+    normalized: List[List[str]] = []
+    for base_parts, location in temp_parts:
+        padded = list(base_parts)
+        if len(padded) < max_parts:
+            padded.extend([""] * (max_parts - len(padded)))
+        padded.append(location or "")
+        normalized.append(padded)
+
+    labels = [f"Case part {i+1}" for i in range(max_parts)] + ["Location"]
+    return normalized, labels
+
+
+@st.cache_data(show_spinner=False)
+def _checkbox_key_map(col_key: str, options_disp: Tuple[str, ...]) -> Dict[str, str]:
+    keys: Dict[str, str] = {}
+    for o in options_disp:
+        h = hashlib.sha1(o.encode("utf-8")).hexdigest()[:12]
+        keys[o] = f"{col_key}__opt__{h}"
+    return keys
+
+
+def build_filters_for_case_parts(all_cases: List[str]) -> Tuple[List[str], List[str]]:
+    st.sidebar.header("Case Filters")
+    if not all_cases:
+        return [], []
+    parts_matrix, part_labels = split_case_parts(all_cases)
+    if not part_labels:
+        return all_cases, []
+
+    reset_all = st.sidebar.button("Reset all filters", key="case_filters_reset_all")
+    keep = np.ones(len(all_cases), dtype=bool)
+    parts_arr = np.array(parts_matrix, dtype=object)  # shape=(n_cases, n_parts)
+    for i, label in enumerate(part_labels):
+        col_key = f"case_part_{i+1}_ms"
+        options = sorted(set(parts_arr[:, i].tolist()))
+        options_disp = [o if o != "" else "<empty>" for o in options]
+
+        # init/sanitize
+        if reset_all or col_key not in st.session_state:
+            st.session_state[col_key] = list(options_disp)
+        else:
+            st.session_state[col_key] = [v for v in st.session_state[col_key] if v in options_disp]
+
+        st.sidebar.markdown(label)
+        c1, _c2 = st.sidebar.columns([1, 1])
+
+        checkbox_keys = _checkbox_key_map(col_key, tuple(options_disp))
+
+        if c1.button("Select all", key=f"{col_key}_all"):
+            st.session_state[col_key] = list(options_disp)
+            for o in options_disp:
+                st.session_state[checkbox_keys[o]] = True
+
+        if _c2.button("Clear all", key=f"{col_key}_none"):
+            st.session_state[col_key] = []
+            for o in options_disp:
+                st.session_state[checkbox_keys[o]] = False
+
+        if reset_all:
+            for o in options_disp:
+                st.session_state[checkbox_keys[o]] = True
+
+        selected_disp: List[str] = []
+        selected_set = set(st.session_state[col_key])
+        cols = st.sidebar.columns(2)
+        for idx, o in enumerate(options_disp):
+            opt_key = checkbox_keys[o]
+            if opt_key not in st.session_state:
+                st.session_state[opt_key] = o in selected_set
+            checked = cols[idx % 2].checkbox(o, key=opt_key)
+            if checked:
+                selected_disp.append(o)
+        st.session_state[col_key] = selected_disp
+
+        if i < len(part_labels) - 1:
+            st.sidebar.markdown("---")
+
+        selected_raw = ["" if s == "<empty>" else s for s in selected_disp]
+        if 0 < len(selected_raw) < len(options):
+            mask_i = np.isin(parts_arr[:, i], selected_raw)
+            keep &= mask_i
+        if len(selected_raw) == 0:
+            keep &= False
+    filtered = [c for c, k in zip(all_cases, keep) if k]
+    return filtered, part_labels
+
+
+def compute_common_n_range(f_series: List[pd.Series], f_base: float) -> Tuple[float, float]:
+    vals: List[float] = []
+    for s in f_series:
+        if s is None:
+            continue
+        v = s
+        if not pd.api.types.is_numeric_dtype(v):
+            v = pd.to_numeric(v, errors="coerce")
+        v = v.dropna()
+        if not v.empty:
+            vals.extend([v.min() / f_base, v.max() / f_base])
+    if not vals:
+        return 0.0, 1.0
+    lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
+    return (0.0, 1.0) if (not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi) else (lo, hi)
+
+
+def add_harmonic_lines(fig: go.Figure, n_min: float, n_max: float, f_base: float, show_markers: bool, bin_width_hz: float):
+    if not show_markers and (bin_width_hz is None or bin_width_hz <= 0):
+        return
+    shapes = []
+    k_start = max(1, int(np.floor(n_min)))
+    k_end = int(np.ceil(n_max))
+    for k in range(k_start, k_end + 1):
+        if show_markers:
+            shapes.append(dict(type="line", xref="x", yref="paper", x0=k, x1=k, y0=0, y1=1, line=dict(color="rgba(0,0,0,0.3)", width=1.5)))
+        if bin_width_hz and bin_width_hz > 0:
+            dn = (bin_width_hz / (2.0 * f_base))
+            for edge in (k - dn, k + dn):
+                shapes.append(dict(type="line", xref="x", yref="paper", x0=edge, x1=edge, y0=0, y1=1, line=dict(color="rgba(0,0,0,0.2)", width=1, dash="dot")))
+    fig.update_layout(shapes=fig.layout.shapes + tuple(shapes) if fig.layout.shapes else tuple(shapes))
+
+
+def make_spline_traces(
+    df: pd.DataFrame,
+    cases: List[str],
+    f_base: float,
+    y_title: str,
+    smooth: float,
+    enable_spline: bool,
+    strip_location_suffix: bool,
+    case_colors: Dict[str, str],
+) -> Tuple[List[BaseTraceType], Optional[pd.Series]]:
+    if df is None:
+        return [], None
+    f = df["Frequency (Hz)"]
+    cd = f.to_numpy()
+    n = cd / float(f_base)
+    traces: List[BaseTraceType] = []
+    TraceCls = go.Scatter if enable_spline else go.Scattergl
+    for case in cases:
+        if case not in df.columns:
+            continue
+        y_s = df[case]
+        if not pd.api.types.is_numeric_dtype(y_s):
+            y_s = pd.to_numeric(y_s, errors="coerce")
+        y = y_s.to_numpy()
+        color = case_colors.get(case)
+        tr = TraceCls(
+            x=n,
+            y=y,
+            customdata=cd,
+            mode="lines",
+            name=display_case_name(case) if strip_location_suffix else str(case),
+            meta={"legend_color": color},
+            line=dict(color=color),
+            hovertemplate=(
+                "Case=%{fullData.name}<br>f=%{customdata:.1f} Hz" + f"<br>{y_title}=%{{y}}<extra></extra>"
+            ),
+        )
+        if enable_spline and isinstance(tr, go.Scatter):
+            tr.update(line=dict(shape="spline", smoothing=float(smooth), simplify=False, color=color))
+        traces.append(tr)
+    return traces, f
+
+
+def apply_common_layout(
+    fig: go.Figure,
+    plot_height: int,
+    y_title: str,
+    legend_entrywidth: int,
+    n_traces: int,
+    use_auto_width: bool,
+    figure_width_px: int,
+):
+    # Web view: reserve a capped legend area so:
+    # - the plot area stays exactly `plot_height`
+    # - the legend never draws outside the figure (overlapping the next chart)
+    # - if legend is larger than the cap, Plotly shows an internal scrollbar
+    # NOTE: when using auto-width, Python doesn't know the real pixel width. Use a conservative
+    # estimate so we allocate more legend height (avoid clipping/overlap).
+    est_width_px = int(figure_width_px) if not use_auto_width else int(AUTO_WIDTH_ESTIMATE_PX)
+    legend_h_full = _estimate_legend_height_px(int(n_traces), est_width_px, int(legend_entrywidth))
+    # Option 2 (web): cap reserved legend area to avoid huge blank gaps between plots.
+    # When the legend exceeds this cap, Plotly may show an internal legend scrollbar.
+    legend_h = min(int(WEB_LEGEND_MAX_HEIGHT_PX), int(legend_h_full))
+    total_height = int(plot_height) + int(TOP_MARGIN_PX) + int(BOTTOM_AXIS_PX) + int(legend_h)
+    # Put the legend in the bottom margin so the plot area stays exactly `plot_height`.
+    legend_y = -float(BOTTOM_AXIS_PX) / float(max(1, int(plot_height)))
+    font_base = dict(family=STYLE["font_family"], color=STYLE["font_color"])
+    fig.update_layout(
+        autosize=bool(use_auto_width),
+        height=total_height,
+        font=dict(
+            **font_base,
+            size=int(STYLE["base_font_size_px"]),
+        ),
+        margin=dict(
+            l=LEFT_MARGIN_PX,
+            r=RIGHT_MARGIN_PX,
+            t=TOP_MARGIN_PX,
+            b=int(BOTTOM_AXIS_PX) + int(legend_h),
+        ),
+        margin_autoexpand=False,
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=legend_y,
+            xanchor="center",
+            x=0.5,
+            entrywidth=int(legend_entrywidth),
+            entrywidthmode="pixels",
+            font=dict(
+                **font_base,
+                size=int(STYLE["legend_font_size_px"]),
+            ),
+        ),
+    )
+    if not use_auto_width:
+        fig.update_layout(width=int(figure_width_px), autosize=False)
+
+    x_title = "Harmonic number n = f / f_base"
+    y_title_txt = str(y_title)
+    if bool(STYLE.get("bold_axis_titles", True)):
+        x_title = f"<b>{x_title}</b>"
+        y_title_txt = f"<b>{y_title_txt}</b>"
+
+    axis_title_font = dict(**font_base, size=int(STYLE["axis_title_font_size_px"]))
+    tick_font = dict(**font_base, size=int(STYLE["tick_font_size_px"]))
+    fig.update_xaxes(
+        title_text=x_title,
+        tick0=1,
+        dtick=1,
+        title_font=axis_title_font,
+        tickfont=tick_font,
+        showline=True,
+        linecolor=STYLE["axis_line_color"],
+        linewidth=int(STYLE["axis_line_width"]),
+        mirror=bool(STYLE["axis_mirror"]),
+    )
+    fig.update_yaxes(
+        title_text=y_title_txt,
+        title_font=axis_title_font,
+        tickfont=tick_font,
+        showline=True,
+        linecolor=STYLE["axis_line_color"],
+        linewidth=int(STYLE["axis_line_width"]),
+        mirror=bool(STYLE["axis_mirror"]),
+    )
+
+
+def build_plot_spline(df: Optional[pd.DataFrame], cases: List[str], f_base: float, plot_height: int, y_title: str,
+                      smooth: float, enable_spline: bool, legend_entrywidth: int, strip_location_suffix: bool,
+                      use_auto_width: bool, figure_width_px: int, case_colors: Dict[str, str]
+                      ) -> Tuple[go.Figure, Optional[pd.Series]]:
+    traces, f_series = make_spline_traces(df, cases, f_base, y_title, smooth, enable_spline, strip_location_suffix, case_colors)
+    fig = go.Figure(data=traces)
+    apply_common_layout(fig, plot_height, y_title, legend_entrywidth, len(traces), use_auto_width, figure_width_px)
+    return fig, f_series
+
+
+def build_x_over_r_spline(df_r: Optional[pd.DataFrame], df_x: Optional[pd.DataFrame], cases: List[str], f_base: float,
+                          plot_height: int, seq_label: str, smooth: float, legend_entrywidth: int,
+                          enable_spline: bool,
+                          strip_location_suffix: bool, use_auto_width: bool, figure_width_px: int,
+                          case_colors: Dict[str, str]
+                          ) -> Tuple[go.Figure, Optional[pd.Series], int, int]:
+    fig = go.Figure()
+    xr_dropped = 0
+    xr_total = 0
+    f_series = None
+    eps = 1e-9
+    TraceCls = go.Scatter if enable_spline else go.Scattergl
+    if df_r is not None and df_x is not None:
+        both = [c for c in cases if c in df_r.columns and c in df_x.columns]
+        f_series = df_r["Frequency (Hz)"]
+        cd = f_series.to_numpy()
+        n = cd / float(f_base)
+        for case in both:
+            r_s = df_r[case]
+            x_s = df_x[case]
+            if not pd.api.types.is_numeric_dtype(r_s):
+                r_s = pd.to_numeric(r_s, errors="coerce")
+            if not pd.api.types.is_numeric_dtype(x_s):
+                x_s = pd.to_numeric(x_s, errors="coerce")
+            r = r_s.to_numpy()
+            x = x_s.to_numpy()
+            denom_ok = np.abs(r) >= eps
+            bad = (~denom_ok) | np.isnan(r) | np.isnan(x)
+            y = np.where(denom_ok, x / r, np.nan)
+            xr_dropped += int(np.count_nonzero(bad))
+            xr_total += int(r.size)
+            color = case_colors.get(case)
+            tr = TraceCls(
+                x=n,
+                y=y,
+                customdata=cd,
+                mode="lines",
+                name=display_case_name(case) if strip_location_suffix else str(case),
+                meta={"legend_color": color},
+                line=dict(color=color),
+                hovertemplate=(
+                    "Case=%{fullData.name}<br>f=%{customdata:.1f} Hz<br>X/R=%{y}<extra></extra>"
+                ),
+            )
+            if enable_spline and isinstance(tr, go.Scatter):
+                tr.update(line=dict(shape="spline", smoothing=float(smooth), simplify=False, color=color))
+            fig.add_trace(tr)
+    y_title = "X1/R1 (unitless)" if seq_label == "Positive" else "X0/R0 (unitless)"
+    apply_common_layout(fig, plot_height, y_title, legend_entrywidth, len(fig.data), use_auto_width, figure_width_px)
+    return fig, f_series, xr_dropped, xr_total
+
+
+def _build_export_figure(fig: go.Figure, plot_height: int, width_px: int, legend_entrywidth: int) -> go.Figure:
+    # Export uses client-side measurement; this just creates a deterministic base layout.
+    fig_export = go.Figure(fig.to_dict())
+    min_legend_h = int(LEGEND_ROW_HEIGHT_PX) + int(LEGEND_PADDING_PX)
+    bottom = int(BOTTOM_AXIS_PX) + int(min_legend_h)
+    total_h = int(plot_height) + int(TOP_MARGIN_PX) + int(bottom)
+    fig_export.update_layout(
+        width=int(DEFAULT_FIGURE_WIDTH_PX if int(width_px) <= 0 else int(width_px)),
+        height=int(total_h),
+        autosize=False,
+        margin=dict(
+            l=LEFT_MARGIN_PX,
+            r=RIGHT_MARGIN_PX,
+            t=TOP_MARGIN_PX,
+            b=int(bottom),
+        ),
+        legend=dict(
+            entrywidth=int(legend_entrywidth),
+            entrywidthmode="pixels",
+            orientation="h",
+            x=0.5,
+            xanchor="center",
+            y=-float(BOTTOM_AXIS_PX) / float(max(1, int(plot_height))),
+            yanchor="top",
+        ),
+    )
+    return fig_export
+
+
+def _fig_to_svg_safe_json(fig: go.Figure) -> str:
+    """
+    Convert `scattergl` traces to `scatter` so browser PNG export isn't blank when WebGL is used for speed.
+    """
+    d = fig.to_dict()
+    for tr in d.get("data", []):
+        if tr.get("type") == "scattergl":
+            tr["type"] = "scatter"
+    return json.dumps(d, cls=PlotlyJSONEncoder)
+
+
+def _render_client_png_download(
+    fig: go.Figure,
+    filename: str,
+    width_px: int,
+    height_px: int,
+    scale: int,
+    button_label: str,
+    plot_height: int,
+    legend_entrywidth: int,
+    plot_index: int,
+):
+    fig_json = _fig_to_svg_safe_json(fig)
+    dom_id = hashlib.sha1(f"{filename}|{width_px}|{height_px}|{scale}".encode("utf-8")).hexdigest()[:12]
+    html = f"""
+    <div id="exp-{dom_id}">
+      <button id="btn-{dom_id}" style="padding:6px 10px; font-size: 0.9rem; cursor:pointer;">
+        {button_label}
+      </button>
+      <div id="plot-{dom_id}" style="width:{int(width_px)}px; height:{int(height_px)}px; display:none;"></div>
+    </div>
+    <script>
+      const fig = {fig_json};
+      const requestedWidthPx = {int(width_px)};
+      const heightPx = {int(height_px)};
+      const scale = {int(scale)};
+      const plotHeight = {int(plot_height)};
+      const topMargin = {int(TOP_MARGIN_PX)};
+      const bottomAxis = {int(BOTTOM_AXIS_PX)};
+      const legendPad = {int(LEGEND_PADDING_PX)};
+      const legendEntryWidth = {int(legend_entrywidth)};
+      const plotIndex = {int(plot_index)};
+      const legendRowH = {int(LEGEND_ROW_HEIGHT_PX)};
+
+      function resolveExportWidthPx() {{
+        // When the app uses "Auto width (fit container)", Python doesn't know the real pixel width.
+        // Measure the already-rendered Plotly chart width from the parent document for a perfect match.
+        if (requestedWidthPx && requestedWidthPx > 0) return requestedWidthPx;
+        try {{
+          const plots = window.parent?.document?.querySelectorAll?.("div.js-plotly-plot");
+          if (plots && plots.length > plotIndex && plots[plotIndex]) {{
+            const r = plots[plotIndex].getBoundingClientRect();
+            const w = Math.floor(r.width || 0);
+            if (w > 0) return w;
+          }}
+        }} catch (e) {{}}
+        // Fallback: a conservative width that usually fits the main column.
+        const w = Math.floor((window.parent?.innerWidth || window.innerWidth || 1400) * 0.72);
+        return Math.max(700, Math.min(2000, w));
+      }}
+
+      function ensurePlotlyLoaded() {{
+        if (window.Plotly) return Promise.resolve(window.Plotly);
+        return new Promise((resolve, reject) => {{
+          const script = document.createElement("script");
+          script.src = "https://cdn.plot.ly/plotly-2.30.0.min.js";
+          script.async = true;
+          script.onload = () => resolve(window.Plotly);
+          script.onerror = () => reject(new Error("Failed to load Plotly from CDN"));
+          document.head.appendChild(script);
+        }});
+      }}
+
+      async function doExport() {{
+        let Plotly;
+        try {{
+          Plotly = await ensurePlotlyLoaded();
+        }} catch (e) {{
+          return;
+        }}
+
+        const container = document.getElementById("plot-{dom_id}");
+
+        function setFrameHeight(px) {{
+          try {{
+            window.parent.postMessage({{
+              isStreamlitMessage: true,
+              type: "streamlit:setFrameHeight",
+              height: px
+            }}, "*");
+          }} catch (e) {{}}
+        }}
+
+        container.style.display = "block";
+        try {{
+          const cfg = {{displayModeBar: false, staticPlot: true}};
+
+          const widthPx = resolveExportWidthPx();
+          const baseLayout = Object.assign({{}}, fig.layout || {{}});
+          baseLayout.width = widthPx;
+          baseLayout.autosize = false;
+          baseLayout.margin = Object.assign({{}}, baseLayout.margin || {{}});
+          baseLayout.margin.t = topMargin;
+          baseLayout.margin.l = {int(LEFT_MARGIN_PX)};
+          baseLayout.margin.r = {int(RIGHT_MARGIN_PX)};
+
+          baseLayout.legend = Object.assign({{}}, baseLayout.legend || {{}});
+
+          // Build a "full legend" layout by expanding height to fit all legend rows.
+          // Keep Plotly legend (no manual legend drawing) so styling matches the on-page figure.
+          const traces = Array.isArray(fig.data) ? fig.data : [];
+          const legendItems = traces.filter((tr) => tr && tr.name && tr.showlegend !== false);
+          const usableW = Math.max(1, widthPx - {int(LEFT_MARGIN_PX)} - {int(RIGHT_MARGIN_PX)});
+          const cols = Math.max(1, Math.floor(usableW / Math.max(1, legendEntryWidth)));
+          const rows = Math.ceil(legendItems.length / cols);
+          const legendH = rows * legendRowH + legendPad;
+
+          baseLayout.height = plotHeight + topMargin + bottomAxis + legendH;
+          baseLayout.margin.b = bottomAxis + legendH;
+
+          baseLayout.legend = Object.assign({{}}, baseLayout.legend || {{}});
+          baseLayout.legend.entrywidth = legendEntryWidth;
+          baseLayout.legend.entrywidthmode = "pixels";
+          baseLayout.legend.orientation = "h";
+          baseLayout.legend.x = 0.5;
+          baseLayout.legend.xanchor = "center";
+          baseLayout.legend.y = -(bottomAxis / Math.max(1, plotHeight));
+          baseLayout.legend.yanchor = "top";
+
+          // Ensure the component iframe isn't clipping the plot while we render/export.
+          const renderH = baseLayout.height || (plotHeight + topMargin + bottomAxis + 400);
+          setFrameHeight(renderH + 120);
+          container.style.height = renderH + "px";
+          container.style.overflow = "visible";
+          await Plotly.newPlot(container, fig.data, baseLayout, cfg);
+
+          const finalH = (container && container._fullLayout && container._fullLayout.height) ? container._fullLayout.height : (baseLayout.height || renderH);
+          const url = await Plotly.toImage(container, {{format: "png", width: widthPx, height: finalH, scale}});
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = "{filename}";
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+        }} catch (e) {{
+        }} finally {{
+          container.style.display = "none";
+          container.style.height = "1px";
+          setFrameHeight(70);
+        }}
+      }}
+
+      document.getElementById("btn-{dom_id}").addEventListener("click", doExport);
+    </script>
+    """
+    components.html(html, height=70)
+
+
+def main():
+    st.title("FS Sweep Visualizer (Spline)")
+
+    # Data source
+    default_path = "FS_sweep.xlsx"
+    st.sidebar.header("Data Source")
+    up = st.sidebar.file_uploader("Upload Excel", type=["xlsx"], help="If empty, loads 'FS_sweep.xlsx' from this folder.")
+    try:
+        if up is not None:
+            data = load_fs_sweep_xlsx(up)
+        elif os.path.exists(default_path):
+            data = load_fs_sweep_xlsx(default_path)
+            st.sidebar.info(f"Loaded local file: {default_path}")
+        else:
+            st.warning("Upload an Excel file or place 'FS_sweep.xlsx' here.")
+            st.stop()
+    except Exception as e:
+        st.error(f"Failed to load Excel: {e}")
+        st.stop()
+
+    # Controls
+    st.sidebar.header("Controls")
+    seq_label = st.sidebar.radio("Sequence", ["Positive", "Zero"], index=0)
+    seq = ("R1", "X1") if seq_label == "Positive" else ("R0", "X0")
+    base_label = st.sidebar.radio("Base frequency", ["50 Hz", "60 Hz"], index=0)
+    f_base = 50.0 if base_label.startswith("50") else 60.0
+    plot_height = st.sidebar.slider("Plot area height (px)", min_value=100, max_value=1000, value=400, step=25)
+    use_auto_width = st.sidebar.checkbox("Auto width (fit container)", value=True)
+    figure_width_px = DEFAULT_FIGURE_WIDTH_PX
+    if not use_auto_width:
+        figure_width_px = st.sidebar.slider("Figure width (px)", min_value=800, max_value=2200, value=DEFAULT_FIGURE_WIDTH_PX, step=50)
+
+    enable_spline = st.sidebar.checkbox("Spline (slow)", value=False)
+    smooth = float(DEFAULT_SPLINE_SMOOTHING)
+    if enable_spline:
+        prev_smooth = st.session_state.get("spline_smoothing", float(DEFAULT_SPLINE_SMOOTHING))
+        try:
+            prev_smooth_f = float(prev_smooth)
+        except Exception:
+            prev_smooth_f = float(DEFAULT_SPLINE_SMOOTHING)
+        prev_smooth_f = max(0.0, min(1.3, prev_smooth_f))
+        smooth = st.sidebar.slider(
+            "Spline smoothing",
+            min_value=0.0,
+            max_value=1.3,
+            value=prev_smooth_f,
+            step=0.05,
+            key="spline_smoothing",
+        )
+
+    # Legend/Export controls
+    st.sidebar.header("Legend & Export")
+    auto_legend_entrywidth = st.sidebar.checkbox("Auto legend column width", value=True)
+    legend_entrywidth = 180
+    if not auto_legend_entrywidth:
+        legend_entrywidth = st.sidebar.slider("Legend column width (px)", min_value=50, max_value=300, value=180, step=10)
+
+    # Keep the download buttons visually within the "Legend & Export" section,
+    # but fill their contents later once figures are built.
+    download_area = st.sidebar.container()
+
+    download_config = {
+        "toImageButtonOptions": {
+            "format": "png",
+            "filename": "plot",
+            "scale": 4,
+        }
+    }
+
+    # Cases / filters
+    df_r = data.get(seq[0])
+    df_x = data.get(seq[1])
+    if df_r is None and df_x is None:
+        st.error(f"Missing sheets for sequence '{seq_label}' ({seq[0]}/{seq[1]}).")
+        st.stop()
+    all_cases = sorted(list({*list_case_columns(df_r), *list_case_columns(df_x)}))
+    filtered_cases, part_labels = build_filters_for_case_parts(all_cases)
+    if not filtered_cases:
+        st.warning("No cases after filtering. Adjust filters.")
+        st.stop()
+
+    strip_location_suffix = False
+    if part_labels and part_labels[-1] == "Location":
+        loc_key = f"case_part_{len(part_labels)}_ms"
+        selected_disp = st.session_state.get(loc_key, [])
+        selected_raw = ["" if s == "<empty>" else s for s in selected_disp]
+        strip_location_suffix = len(selected_raw) == 1
+
+    if auto_legend_entrywidth:
+        display_names = [display_case_name(c) if strip_location_suffix else str(c) for c in filtered_cases]
+        max_len = max((len(n) for n in display_names), default=12)
+        approx_char_px = 7
+        base_px = 44  # symbol + padding inside a legend item
+        legend_entrywidth = _clamp_int(max_len * approx_char_px + base_px, 50, 300)
+
+    case_colors = cached_clustered_case_colors(tuple(filtered_cases))
+
+    # Harmonic decorations
+    show_harmonics = st.sidebar.checkbox("Show harmonic lines", value=True)
+    bin_width_hz = st.sidebar.number_input("Bin width (Hz)", min_value=0.0, value=0.0, step=1.0, help="0 disables tolerance bands")
+
+    # Build plots
+    r_title = "R1 (\u03A9)" if seq_label == "Positive" else "R0 (\u03A9)"
+    x_title = "X1 (\u03A9)" if seq_label == "Positive" else "X0 (\u03A9)"
+    fig_r, f_r = build_plot_spline(
+        df_r,
+        filtered_cases,
+        f_base,
+        plot_height,
+        r_title,
+        smooth,
+        enable_spline,
+        legend_entrywidth,
+        strip_location_suffix,
+        use_auto_width,
+        figure_width_px,
+        case_colors,
+    )
+    fig_x, f_x = build_plot_spline(
+        df_x,
+        filtered_cases,
+        f_base,
+        plot_height,
+        x_title,
+        smooth,
+        enable_spline,
+        legend_entrywidth,
+        strip_location_suffix,
+        use_auto_width,
+        figure_width_px,
+        case_colors,
+    )
+    fig_xr, f_xr, xr_dropped, xr_total = build_x_over_r_spline(
+        df_r,
+        df_x,
+        filtered_cases,
+        f_base,
+        plot_height,
+        seq_label,
+        smooth,
+        legend_entrywidth,
+        enable_spline,
+        strip_location_suffix,
+        use_auto_width,
+        figure_width_px,
+        case_colors,
+    )
+
+    f_refs = [s for s in [f_r, f_x, f_xr] if s is not None]
+    n_lo, n_hi = compute_common_n_range(f_refs, f_base)
+    harm_shapes = build_harmonic_shapes(n_lo, n_hi, f_base, show_harmonics, bin_width_hz)
+    for fig in (fig_r, fig_x, fig_xr):
+        fig.update_xaxes(range=[n_lo, n_hi])
+        if harm_shapes:
+            fig.update_layout(shapes=(fig.layout.shapes + harm_shapes) if fig.layout.shapes else harm_shapes)
+
+    # Render
+    st.subheader(f"Sequence: {seq_label} | Base: {int(f_base)} Hz")
+    if xr_total > 0 and xr_dropped > 0:
+        st.caption(f"X/R: dropped {xr_dropped} of {xr_total} points where |R| < 1e-9 or data missing.")
+
+    export_scale = 4
+    export_width_px = int(figure_width_px) if not use_auto_width else -1
+    with download_area:
+        st.subheader("Download (Full Legend)")
+        st.caption("Browser PNG download (requires access to https://cdn.plot.ly).")
+        cols = st.columns(3)
+        with cols[0]:
+            fig_x_export = _build_export_figure(fig_x, plot_height, export_width_px, legend_entrywidth)
+            _render_client_png_download(
+                fig_x_export,
+                filename="X_full_legend.png",
+                width_px=export_width_px,
+                height_px=int(fig_x_export.layout.height or 800),
+                scale=export_scale,
+                button_label="X PNG",
+                plot_height=plot_height,
+                legend_entrywidth=legend_entrywidth,
+                plot_index=0,
+            )
+        with cols[1]:
+            fig_r_export = _build_export_figure(fig_r, plot_height, export_width_px, legend_entrywidth)
+            _render_client_png_download(
+                fig_r_export,
+                filename="R_full_legend.png",
+                width_px=export_width_px,
+                height_px=int(fig_r_export.layout.height or 800),
+                scale=export_scale,
+                button_label="R PNG",
+                plot_height=plot_height,
+                legend_entrywidth=legend_entrywidth,
+                plot_index=1,
+            )
+        with cols[2]:
+            fig_xr_export = _build_export_figure(fig_xr, plot_height, export_width_px, legend_entrywidth)
+            _render_client_png_download(
+                fig_xr_export,
+                filename="X_over_R_full_legend.png",
+                width_px=export_width_px,
+                height_px=int(fig_xr_export.layout.height or 800),
+                scale=export_scale,
+                button_label="X/R PNG",
+                plot_height=plot_height,
+                legend_entrywidth=legend_entrywidth,
+                plot_index=2,
+            )
+
+    st.plotly_chart(fig_x, use_container_width=bool(use_auto_width), config=download_config)
+    st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
+    st.plotly_chart(fig_r, use_container_width=bool(use_auto_width), config=download_config)
+    st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
+    st.plotly_chart(fig_xr, use_container_width=bool(use_auto_width), config=download_config)
+
+
+if __name__ == "__main__":
+    main()
