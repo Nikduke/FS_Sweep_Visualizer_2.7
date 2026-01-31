@@ -33,9 +33,9 @@ STYLE = {
     "tick_font_size_px": 14,
     "axis_title_font_size_px": 16,
     # Space between x tick labels and the x-axis title (px). Set to None to use auto heuristic.
-    "xaxis_title_standoff_px": None,
+    "xaxis_title_standoff_px": 25,
     # Space between y tick labels and the y-axis title (px). Set to None to use auto heuristic.
-    "yaxis_title_standoff_px": 30,
+    "yaxis_title_standoff_px": None,
     "legend_font_size_px": 14,
     "bold_axis_titles": True,
 }
