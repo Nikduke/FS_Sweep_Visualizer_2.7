@@ -19,7 +19,7 @@ st.set_page_config(page_title="FS Sweep Visualizer (Spline)", layout="wide")
 # NOTE: Keep the bottom-legend layout; axis overlap is handled by axis title standoff.
 DEFAULT_FIGURE_WIDTH_PX = 1400  # Default figure width (px) when auto-width is disabled.
 TOP_MARGIN_PX = 40  # Top margin (px); room for title/toolbar while keeping plot-area height stable.
-BOTTOM_AXIS_PX = 50  # Bottom margin reserved for x-axis title/ticks (px); also defines plot-to-legend vertical gap.
+BOTTOM_AXIS_PX = 60  # Bottom margin reserved for x-axis title/ticks (px); also defines plot-to-legend vertical gap.
 LEFT_MARGIN_PX = 60  # Left margin (px); room for y-axis title and tick labels.
 RIGHT_MARGIN_PX = 20  # Right margin (px); small breathing room to avoid clipping.
 LEGEND_ROW_HEIGHT_FACTOR = 1.6  # legend row height ~= legend_font_size * factor
@@ -33,7 +33,7 @@ STYLE = {
     "tick_font_size_px": 14,
     "axis_title_font_size_px": 16,
     # Space between x tick labels and the x-axis title (px). Set to None to use auto heuristic.
-    "xaxis_title_standoff_px": 25,
+    "xaxis_title_standoff_px": None,
     # Space between y tick labels and the y-axis title (px). Set to None to use auto heuristic.
     "yaxis_title_standoff_px": None,
     "legend_font_size_px": 14,
@@ -290,6 +290,17 @@ def display_case_name(name: str) -> str:
 
 
 @st.cache_data(show_spinner=False)
+def prepare_sheet_arrays(df: pd.DataFrame) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    freq_hz = df["Frequency (Hz)"].to_numpy(copy=False)
+    series_map: Dict[str, np.ndarray] = {}
+    for c in df.columns:
+        if c == "Frequency (Hz)":
+            continue
+        series_map[str(c)] = df[c].to_numpy(copy=False)
+    return freq_hz, series_map
+
+
+@st.cache_data(show_spinner=False)
 def split_case_parts(cases: List[str]) -> Tuple[List[List[str]], List[str]]:
     if not cases:
         return [], []
@@ -417,18 +428,14 @@ def make_spline_traces(
 ) -> Tuple[List[BaseTraceType], Optional[pd.Series]]:
     if df is None:
         return [], None
-    f = df["Frequency (Hz)"]
-    cd = f.to_numpy()
+    cd, y_map = prepare_sheet_arrays(df)
     n = cd / float(f_base)
     traces: List[BaseTraceType] = []
     TraceCls = go.Scatter if enable_spline else go.Scattergl
     for case in cases:
-        if case not in df.columns:
+        y = y_map.get(case)
+        if y is None:
             continue
-        y_s = df[case]
-        if not pd.api.types.is_numeric_dtype(y_s):
-            y_s = pd.to_numeric(y_s, errors="coerce")
-        y = y_s.to_numpy()
         color = case_colors.get(case)
         tr = TraceCls(
             x=n,
@@ -445,7 +452,7 @@ def make_spline_traces(
         if enable_spline and isinstance(tr, go.Scatter):
             tr.update(line=dict(shape="spline", smoothing=float(smooth), simplify=False, color=color))
         traces.append(tr)
-    return traces, f
+    return traces, df["Frequency (Hz)"]
 
 
 def apply_common_layout(
@@ -484,6 +491,8 @@ def apply_common_layout(
     fig.update_layout(
         autosize=bool(use_auto_width),
         height=total_height,
+        # Keep zoom/pan on Streamlit reruns (including when case list changes).
+        uirevision="keep",
         font=dict(
             **font_base,
             size=int(STYLE["base_font_size_px"]),
@@ -570,19 +579,14 @@ def build_x_over_r_spline(df_r: Optional[pd.DataFrame], df_x: Optional[pd.DataFr
     eps = 1e-9
     TraceCls = go.Scatter if enable_spline else go.Scattergl
     if df_r is not None and df_x is not None:
-        both = [c for c in cases if c in df_r.columns and c in df_x.columns]
-        f_series = df_r["Frequency (Hz)"]
-        cd = f_series.to_numpy()
+        cd, r_map = prepare_sheet_arrays(df_r)
+        _cd2, x_map = prepare_sheet_arrays(df_x)
         n = cd / float(f_base)
+        both = [c for c in cases if (c in r_map and c in x_map)]
+        f_series = df_r["Frequency (Hz)"]
         for case in both:
-            r_s = df_r[case]
-            x_s = df_x[case]
-            if not pd.api.types.is_numeric_dtype(r_s):
-                r_s = pd.to_numeric(r_s, errors="coerce")
-            if not pd.api.types.is_numeric_dtype(x_s):
-                x_s = pd.to_numeric(x_s, errors="coerce")
-            r = r_s.to_numpy()
-            x = x_s.to_numpy()
+            r = r_map[case]
+            x = x_map[case]
             denom_ok = np.abs(r) >= eps
             bad = (~denom_ok) | np.isnan(r) | np.isnan(x)
             y = np.where(denom_ok, x / r, np.nan)
@@ -800,6 +804,119 @@ def _render_client_png_download(
     components.html(html, height=70)
 
 
+def _enable_zoom_persistence(storage_key: str = "fs_sweep_zoom_state_v1", plot_count: int = 3) -> None:
+    html = f"""
+    <div style="display:none"></div>
+    <script>
+      (function () {{
+        const storageKey = {json.dumps(storage_key)};
+        const plotCount = {int(plot_count)};
+
+        function loadState() {{
+          try {{
+            return JSON.parse(window.parent?.localStorage?.getItem(storageKey) || "{{}}") || {{}};
+          }} catch (e) {{
+            return {{}};
+          }}
+        }}
+
+        function saveState(state) {{
+          try {{
+            window.parent?.localStorage?.setItem(storageKey, JSON.stringify(state));
+          }} catch (e) {{}}
+        }}
+
+        function getPlots() {{
+          return window.parent?.document?.querySelectorAll?.("div.js-plotly-plot") || [];
+        }}
+
+        function extractRanges(evt) {{
+          if (!evt || typeof evt !== "object") return null;
+          const out = {{}};
+
+          if (evt["xaxis.range[0]"] != null && evt["xaxis.range[1]"] != null) {{
+            out.xr = [evt["xaxis.range[0]"], evt["xaxis.range[1]"]];
+          }}
+          if (evt["yaxis.range[0]"] != null && evt["yaxis.range[1]"] != null) {{
+            out.yr = [evt["yaxis.range[0]"], evt["yaxis.range[1]"]];
+          }}
+
+          // Reset (double-click) sends autorange flags; treat that as "clear stored range".
+          if (evt["xaxis.autorange"] === true) out.xr = null;
+          if (evt["yaxis.autorange"] === true) out.yr = null;
+
+          return out;
+        }}
+
+        function bindPlot(gd, idx) {{
+          if (!gd || gd.dataset?.fsZoomBound === "1") return;
+          gd.dataset.fsZoomBound = "1";
+          gd.on?.("plotly_relayout", function (evt) {{
+            const ranges = extractRanges(evt);
+            if (!ranges) return;
+            const state = loadState();
+            const key = String(idx);
+            const prev = state[key] || {{}};
+
+            if ("xr" in ranges) {{
+              if (ranges.xr) prev.xr = ranges.xr;
+              else delete prev.xr;
+            }}
+            if ("yr" in ranges) {{
+              if (ranges.yr) prev.yr = ranges.yr;
+              else delete prev.yr;
+            }}
+
+            state[key] = prev;
+            saveState(state);
+          }});
+        }}
+
+        let applying = false;
+        function applyRanges(gd, idx) {{
+          if (!gd || applying) return;
+          const Plotly = window.parent?.Plotly;
+          if (!Plotly || !gd._fullLayout) return;
+          const state = loadState();
+          const saved = state[String(idx)];
+          if (!saved) return;
+
+          const update = {{}};
+          if (Array.isArray(saved.xr) && saved.xr.length === 2) update["xaxis.range"] = saved.xr;
+          if (Array.isArray(saved.yr) && saved.yr.length === 2) update["yaxis.range"] = saved.yr;
+          if (!Object.keys(update).length) return;
+
+          applying = true;
+          Promise.resolve(Plotly.relayout(gd, update))
+            .catch(function () {{}})
+            .finally(function () {{ applying = false; }});
+        }}
+
+        let t = null;
+        function sync() {{
+          try {{
+            const plots = getPlots();
+            const n = Math.min(plotCount, plots.length);
+            for (let i = 0; i < n; i++) {{
+              bindPlot(plots[i], i);
+              applyRanges(plots[i], i);
+            }}
+          }} catch (e) {{}}
+        }}
+
+        // Run once after current render, then keep watching for Streamlit remounts.
+        sync();
+        const mo = new window.parent.MutationObserver(function () {{
+          if (t) window.parent.clearTimeout(t);
+          t = window.parent.setTimeout(sync, 80);
+        }});
+        mo.observe(window.parent.document.body, {{ childList: true, subtree: true }});
+      }})();
+    </script>
+    """
+    components.html(html, height=0)
+
+
 def main():
     st.title("FS Sweep Visualizer (Spline)")
 
@@ -1002,11 +1119,14 @@ def main():
                 plot_index=2,
             )
 
-    st.plotly_chart(fig_x, use_container_width=bool(use_auto_width), config=download_config)
+    st.plotly_chart(fig_x, use_container_width=bool(use_auto_width), config=download_config, key="plot_x")
     st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
-    st.plotly_chart(fig_r, use_container_width=bool(use_auto_width), config=download_config)
+    st.plotly_chart(fig_r, use_container_width=bool(use_auto_width), config=download_config, key="plot_r")
     st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
-    st.plotly_chart(fig_xr, use_container_width=bool(use_auto_width), config=download_config)
+    st.plotly_chart(fig_xr, use_container_width=bool(use_auto_width), config=download_config, key="plot_xr")
+
+    # Keep zoom/pan between Streamlit reruns by storing/restoring axis ranges in browser storage.
+    _enable_zoom_persistence()
 
 
 if __name__ == "__main__":
