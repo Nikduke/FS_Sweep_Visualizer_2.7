@@ -822,11 +822,15 @@ def _enable_zoom_persistence(storage_key: str = "fs_sweep_zoom_state_v1", plot_c
     <div style="display:none"></div>
     <script>
       (function () {{
-        // Install once in the parent page to avoid repeated observers/polls on every rerun.
-        const installTag = "fs_sweep_zoom_v2";
+        // Install once, but allow each Streamlit rerun to "kick" a short resync loop.
+        const installTag = "fs_sweep_zoom_v3";
+        const parentWin = window.parent || window;
         try {{
-          if (window.parent && window.parent.__fsSweepZoomInstalled === installTag) return;
-          if (window.parent) window.parent.__fsSweepZoomInstalled = installTag;
+          if (parentWin.__fsSweepZoomInstalled === installTag && typeof parentWin.__fsSweepZoomKick === "function") {{
+            parentWin.__fsSweepZoomKick();
+            return;
+          }}
+          parentWin.__fsSweepZoomInstalled = installTag;
         }} catch (e) {{}}
 
         const storageKey = {json.dumps(storage_key)};
@@ -935,13 +939,21 @@ def _enable_zoom_persistence(storage_key: str = "fs_sweep_zoom_state_v1", plot_c
           }} catch (e) {{}}
         }}
 
-        // Reruns can render plots after this script runs; retry briefly but do not poll forever.
-        let tries = 0;
-        (function tick() {{
-          sync();
-          tries += 1;
-          if (tries < 30) window.parent.setTimeout(tick, 100);
-        }})();
+        function kick() {{
+          // Reruns can render plots after this script runs; retry briefly but do not poll forever.
+          let tries = 0;
+          (function tick() {{
+            sync();
+            tries += 1;
+            if (tries < 30) parentWin.setTimeout(tick, 100);
+          }})();
+        }}
+
+        try {{
+          parentWin.__fsSweepZoomKick = kick;
+        }} catch (e) {{}}
+
+        kick();
       }})();
     </script>
     """
