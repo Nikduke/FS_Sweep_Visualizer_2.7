@@ -25,7 +25,7 @@ TOP_MARGIN_PX = 40  # Top margin (px); room for title/toolbar while keeping plot
 BOTTOM_AXIS_PX = 60  # Bottom margin reserved for x-axis title/ticks (px); also defines plot-to-legend vertical gap.
 LEFT_MARGIN_PX = 60  # Left margin (px); room for y-axis title and tick labels.
 RIGHT_MARGIN_PX = 20  # Right margin (px); small breathing room to avoid clipping.
-LEGEND_ROW_HEIGHT_PX = 22  # Used for export-size estimation (px per legend row).
+LEGEND_ROW_HEIGHT_FACTOR = 1.6  # legend row height ~= legend_font_size * factor
 LEGEND_PADDING_PX = 18  # Extra padding (px) below legend to avoid clipping in exports.
 # ---- Style settings (single source of truth) ----
 # Use Plotly layout styling (not CSS) so on-page and exported PNGs match.
@@ -35,13 +35,14 @@ STYLE = {
     "base_font_size_px": 14,
     "tick_font_size_px": 14,
     "axis_title_font_size_px": 16,
-    "legend_font_size_px": 12,
+    "legend_font_size_px": 14,
     "bold_axis_titles": True,
 }
 
 AUTO_WIDTH_ESTIMATE_PX = 950  # Used to estimate legend wrapping when "Auto width" is enabled (smaller => safer, avoids clipping).
 WEB_LEGEND_MAX_HEIGHT_PX = 500  # Max legend area reserved in the web view (px); prevents overlap with the next chart.
-DEFAULT_SPLINE_SMOOTHING = 0.6  # Default Plotly spline smoothing when spline mode is enabled.
+DEFAULT_SPLINE_SMOOTHING = 1.0  # Default Plotly spline smoothing when spline mode is enabled.
+EXPORT_IMAGE_SCALE = 4  # PNG scale factor for both modebar and "Full Legend" export.
 
 
 def _clamp_int(val: int, lo: int, hi: int) -> int:
@@ -231,7 +232,8 @@ def _estimate_legend_height_px(n_traces: int, width_px: int, legend_entrywidth: 
     usable_w = max(1, int(width_px) - int(LEFT_MARGIN_PX) - int(RIGHT_MARGIN_PX))
     cols = max(1, int(usable_w // max(1, int(legend_entrywidth))))
     rows = int(np.ceil(float(n_traces) / float(cols))) if n_traces > 0 else 0
-    return int(rows) * int(LEGEND_ROW_HEIGHT_PX) + int(LEGEND_PADDING_PX)
+    row_h = int(np.ceil(float(STYLE["legend_font_size_px"]) * float(LEGEND_ROW_HEIGHT_FACTOR)))
+    return int(rows) * int(row_h) + int(LEGEND_PADDING_PX)
 
 
 # ---- Data loading ----
@@ -400,22 +402,6 @@ def compute_common_n_range(f_series: List[pd.Series], f_base: float) -> Tuple[fl
         return 0.0, 1.0
     lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
     return (0.0, 1.0) if (not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi) else (lo, hi)
-
-
-def add_harmonic_lines(fig: go.Figure, n_min: float, n_max: float, f_base: float, show_markers: bool, bin_width_hz: float):
-    if not show_markers and (bin_width_hz is None or bin_width_hz <= 0):
-        return
-    shapes = []
-    k_start = max(1, int(np.floor(n_min)))
-    k_end = int(np.ceil(n_max))
-    for k in range(k_start, k_end + 1):
-        if show_markers:
-            shapes.append(dict(type="line", xref="x", yref="paper", x0=k, x1=k, y0=0, y1=1, line=dict(color="rgba(0,0,0,0.3)", width=1.5)))
-        if bin_width_hz and bin_width_hz > 0:
-            dn = (bin_width_hz / (2.0 * f_base))
-            for edge in (k - dn, k + dn):
-                shapes.append(dict(type="line", xref="x", yref="paper", x0=edge, x1=edge, y0=0, y1=1, line=dict(color="rgba(0,0,0,0.2)", width=1, dash="dot")))
-    fig.update_layout(shapes=fig.layout.shapes + tuple(shapes) if fig.layout.shapes else tuple(shapes))
 
 
 def make_spline_traces(
@@ -614,6 +600,7 @@ def _render_client_png_download(
       <button id="btn-{dom_id}" style="padding:6px 10px; font-size: 0.9rem; cursor:pointer;">
         {button_label}
       </button>
+      <div id="plot-{dom_id}" style="width:1px; height:1px; position:absolute; left:-99999px; top:-99999px;"></div>
     </div>
     <script>
       const scale = {int(scale)};
@@ -623,12 +610,11 @@ def _render_client_png_download(
       const legendPad = {int(LEGEND_PADDING_PX)};
       const legendEntryWidth = {int(legend_entrywidth)};
       const plotIndex = {int(plot_index)};
-      const legendRowH = {int(LEGEND_ROW_HEIGHT_PX)};
       const filename = {json.dumps(filename)};
+      const legendRowHFactor = {float(LEGEND_ROW_HEIGHT_FACTOR)};
+      const fallbackLegendFontSize = {int(STYLE["legend_font_size_px"])};
 
       async function doExport() {{
-        let oldHeight = null;
-        let oldMarginB = null;
         try {{
           const Plotly = window.parent?.Plotly;
           if (!Plotly) return;
@@ -641,25 +627,123 @@ def _render_client_png_download(
           const widthPx = Math.floor(r.width || 0);
           if (!widthPx) return;
 
+          const legendFontSize =
+            gd?._fullLayout?.legend?.font?.size ||
+            gd?._fullLayout?.font?.size ||
+            fallbackLegendFontSize;
+          const legendRowH = Math.ceil(legendFontSize * legendRowHFactor);
+          const legendFontFamily = {json.dumps(STYLE["font_family"])};
+          const legendFontColor = {json.dumps(STYLE["font_color"])};
+
           const data = Array.isArray(gd.data) ? gd.data : [];
-          const legendItems = data.filter((tr) => tr && tr.name && tr.showlegend !== false);
+          const data2 = data.map((tr) => {{
+            const t = Object.assign({{}}, tr);
+            if (t.type === "scattergl") t.type = "scatter";
+            return t;
+          }});
+          const legendItems = [];
+          for (const tr of data2) {{
+            const name = tr && tr.name ? String(tr.name) : "";
+            if (!name) continue;
+            const color =
+              (tr.meta && tr.meta.legend_color) ? tr.meta.legend_color :
+              (tr.line && tr.line.color) ? tr.line.color :
+              (tr.marker && tr.marker.color) ? tr.marker.color :
+              "#444";
+            legendItems.push({{name, color}});
+          }}
+
           const usableW = Math.max(1, widthPx - {int(LEFT_MARGIN_PX)} - {int(RIGHT_MARGIN_PX)});
-          const cols = Math.max(1, Math.floor(usableW / Math.max(1, legendEntryWidth)));
+
+          // Estimate needed entry width using canvas text measurement to avoid overlap for long names.
+          let maxTextW = 0;
+          try {{
+            const canvas = document.createElement("canvas");
+            const ctx = canvas.getContext("2d");
+            if (ctx) {{
+              ctx.font = legendFontSize + "px " + legendFontFamily;
+              for (const it of legendItems) {{
+                const w = ctx.measureText(it.name).width || 0;
+                if (w > maxTextW) maxTextW = w;
+              }}
+            }}
+          }} catch (e) {{}}
+
+          const sampleLinePx = Math.max(18, Math.round(1.8 * legendFontSize));
+          const sampleGapPx = Math.max(6, Math.round(0.6 * legendFontSize));
+          const textPadPx = Math.max(8, Math.round(0.8 * legendFontSize));
+          const neededEntryPx = Math.ceil(sampleLinePx + sampleGapPx + maxTextW + textPadPx);
+          const entryPx = Math.max(1, Math.max(legendEntryWidth, neededEntryPx));
+
+          const cols = Math.max(1, Math.floor(usableW / entryPx));
           const rows = Math.ceil(legendItems.length / cols);
           const legendH = rows * legendRowH + legendPad;
-
-          oldHeight = gd._fullLayout?.height;
-          oldMarginB = gd._fullLayout?.margin?.b;
 
           const newHeight = plotHeight + topMargin + bottomAxis + legendH;
           const newMarginB = bottomAxis + legendH;
 
-          await Plotly.relayout(gd, {{
-            height: newHeight,
-            "margin.b": newMarginB,
-          }});
+          const container = document.getElementById("plot-{dom_id}");
+          if (!container) return;
+          container.style.width = widthPx + "px";
+          container.style.height = newHeight + "px";
 
-          const url = await Plotly.toImage(gd, {{format: "png", width: widthPx, height: newHeight, scale}});
+          const baseLayout = Object.assign({{}}, gd.layout || {{}});
+          baseLayout.width = widthPx;
+          baseLayout.height = newHeight;
+          baseLayout.autosize = false;
+          baseLayout.margin = Object.assign({{}}, baseLayout.margin || {{}});
+          baseLayout.margin.t = topMargin;
+          baseLayout.margin.l = {int(LEFT_MARGIN_PX)};
+          baseLayout.margin.r = {int(RIGHT_MARGIN_PX)};
+          baseLayout.margin.b = newMarginB;
+          // Disable Plotly legend and draw a manual legend in the bottom margin so it never scrolls/clips.
+          baseLayout.showlegend = false;
+          for (const tr of data2) {{
+            tr.showlegend = false;
+          }}
+
+          const ann = Array.isArray(baseLayout.annotations) ? baseLayout.annotations.slice() : [];
+          const shp = Array.isArray(baseLayout.shapes) ? baseLayout.shapes.slice() : [];
+
+          const xPadPx = Math.min(12, Math.floor(entryPx * 0.10));
+          const legendTotalW = cols * entryPx;
+          const leftOffsetPx = Math.max(0, Math.floor((usableW - legendTotalW) / 2));
+
+          for (let i = 0; i < legendItems.length; i++) {{
+            const row = Math.floor(i / cols);
+            const col = i % cols;
+            const x0 = (leftOffsetPx + col * entryPx + xPadPx) / usableW;
+            const x1 = x0 + (sampleLinePx / usableW);
+            const y = -(bottomAxis + legendPad + (row + 0.6) * legendRowH) / Math.max(1, plotHeight);
+
+            shp.push({{
+              type: "line",
+              xref: "paper",
+              yref: "paper",
+              x0, x1,
+              y0: y, y1: y,
+              line: {{color: legendItems[i].color, width: 2}}
+            }});
+
+            ann.push({{
+              xref: "paper",
+              yref: "paper",
+              x: x1 + (sampleGapPx / usableW),
+              y,
+              xanchor: "left",
+              yanchor: "middle",
+              showarrow: false,
+              align: "left",
+              text: legendItems[i].name,
+              font: {{size: legendFontSize, family: legendFontFamily, color: legendFontColor}}
+            }});
+          }}
+
+          baseLayout.annotations = ann;
+          baseLayout.shapes = shp;
+
+          await Plotly.newPlot(container, data2, baseLayout, {{displayModeBar: false, staticPlot: true}});
+          const url = await Plotly.toImage(container, {{format: "png", width: widthPx, height: newHeight, scale}});
           const a = document.createElement("a");
           a.href = url;
           a.download = filename;
@@ -669,14 +753,11 @@ def _render_client_png_download(
         }} catch (e) {{
         }} finally {{
           try {{
-            const Plotly = window.parent?.Plotly;
-            const plots = window.parent?.document?.querySelectorAll?.("div.js-plotly-plot");
-            const gd = (plots && plots.length > plotIndex) ? plots[plotIndex] : null;
-            if (Plotly && gd) {{
-              const restore = {{}};
-              if (typeof oldHeight === "number") restore.height = oldHeight;
-              if (typeof oldMarginB === "number") restore["margin.b"] = oldMarginB;
-              if (Object.keys(restore).length) await Plotly.relayout(gd, restore);
+            const container = document.getElementById("plot-{dom_id}");
+            if (container) {{
+              container.innerHTML = "";
+              container.style.width = "1px";
+              container.style.height = "1px";
             }}
           }} catch (e) {{}}
         }}
@@ -753,7 +834,7 @@ def main():
         "toImageButtonOptions": {
             "format": "png",
             "filename": "plot",
-            "scale": 4,
+            "scale": int(EXPORT_IMAGE_SCALE),
         }
     }
 
@@ -779,9 +860,16 @@ def main():
     if auto_legend_entrywidth:
         display_names = [display_case_name(c) if strip_location_suffix else str(c) for c in filtered_cases]
         max_len = max((len(n) for n in display_names), default=12)
-        approx_char_px = 7
-        base_px = 44  # symbol + padding inside a legend item
-        legend_entrywidth = _clamp_int(max_len * approx_char_px + base_px, 50, 300)
+        legend_font_px = int(STYLE["legend_font_size_px"])
+        approx_char_px = max(7, int(round(0.60 * float(legend_font_px))))
+        base_px = max(44, int(round(3.5 * float(legend_font_px))))  # symbol + padding inside a legend item
+
+        est_width_px = int(figure_width_px) if not use_auto_width else int(AUTO_WIDTH_ESTIMATE_PX)
+        usable_w = max(1, int(est_width_px) - int(LEFT_MARGIN_PX) - int(RIGHT_MARGIN_PX))
+        desired = int(max_len) * int(approx_char_px) + int(base_px)
+        legend_entrywidth = _clamp_int(desired, 50, min(900, usable_w))
+        if legend_entrywidth >= int(usable_w * 0.95):
+            legend_entrywidth = usable_w
 
     case_colors = cached_clustered_case_colors(tuple(filtered_cases))
 
@@ -849,7 +937,7 @@ def main():
     if xr_total > 0 and xr_dropped > 0:
         st.caption(f"X/R: dropped {xr_dropped} of {xr_total} points where |R| < 1e-9 or data missing.")
 
-    export_scale = 4
+    export_scale = int(EXPORT_IMAGE_SCALE)
     with download_area:
         st.subheader("Download (Full Legend)")
         st.caption("Browser PNG download (temporarily expands the on-page chart legend, then downloads).")
